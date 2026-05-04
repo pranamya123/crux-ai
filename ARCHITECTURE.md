@@ -190,11 +190,13 @@ In my implementation, I used Supabase as the shared event store because the SDK 
 
 ## Files
 
-- `orchestrator_v2.py` - Main multi-agent orchestrator (shared session)
-- `multi_agent_orchestrator.py` - V1 orchestrator (separate sessions)
-- `app.py` - Flask app for subscribers (Vercel-deployed)
-- `agent.yaml` - Single-agent config (V0, archived)
-- `briefs/` - Run logs and generated briefs
+- `orchestrator_v2.py` - Main multi-agent orchestrator (shared session, sends emails)
+- `email_renderer.py` - Editorial HTML email rendering (with per-recipient unsubscribe)
+- `app.py` - Flask app: subscribe, unsubscribe, latest-issue, admin (Vercel-deployed)
+- `index.py` - Vercel serverless entrypoint that wraps `app.py`
+- `templates/index.html` - Subscribe page
+- `briefs/` - Per-run logs (gitignored)
+- `latest_issue.{html,md,json}` - Snapshot of the most recent send, served by `/latest` (gitignored)
 
 ## How to run
 
