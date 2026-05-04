@@ -89,8 +89,8 @@ def _label(text):
     return f'<div style="font-family:{SANS};font-size:10px;letter-spacing:2.5px;text-transform:uppercase;font-weight:700;color:{MUTED};">{htmllib.escape(text)}</div>'
 
 
-def _back_to_top():
-    return f'<div style="border-top:1px solid {RULE};padding-top:14px;margin-top:48px;font-family:{SANS};font-size:11px;letter-spacing:1.5px;text-transform:uppercase;"><a href="#top" style="color:{MUTED};text-decoration:none;">&uarr; Back to contents</a></div>'
+def _back_to_top(link_prefix: str = ""):
+    return f'<div style="border-top:1px solid {RULE};padding-top:14px;margin-top:48px;font-family:{SANS};font-size:11px;letter-spacing:1.5px;text-transform:uppercase;"><a href="{link_prefix}#top" style="color:{MUTED};text-decoration:none;">&uarr; Back to contents</a></div>'
 
 
 def _drop_cap_first(html):
@@ -99,7 +99,7 @@ def _drop_cap_first(html):
     return pattern.sub(rf'\1<span style="{cap_style}">\2</span>', html, count=1)
 
 
-def _render_item(item, date, anchor_prefix="item", section_label="What shipped", num_format="No.{n:02d}"):
+def _render_item(item, date, anchor_prefix="item", section_label="What shipped", num_format="No.{n:02d}", link_prefix: str = ""):
     num_label = num_format.format(n=item["number"])
     body = _drop_cap_first(_md_block(item["body_md"]))
     return (
@@ -107,7 +107,7 @@ def _render_item(item, date, anchor_prefix="item", section_label="What shipped",
         f'{_label(f"{section_label} · {num_label}")}'
         f'<h2 style="font-family:{SERIF};font-size:32px;line-height:1.18;font-weight:400;letter-spacing:-0.5px;margin:14px 0 12px;color:{INK};">{htmllib.escape(item["headline"])}</h2>'
         f'<div style="font-family:{SERIF};font-style:italic;font-size:13px;color:{MUTED};margin-bottom:32px;">By the AI Weekly Bot · {htmllib.escape(date) if date else ""}</div>'
-        f'<div style="font-family:{SERIF};font-size:18px;line-height:1.7;color:#1f1f1f;">{body}</div>{_back_to_top()}</article>'
+        f'<div style="font-family:{SERIF};font-size:18px;line-height:1.7;color:#1f1f1f;">{body}</div>{_back_to_top(link_prefix)}</article>'
     )
 
 
@@ -119,6 +119,13 @@ def render_brief_email_html(
     brief = _parse_brief(body_markdown)
     title = brief["title"]
     date = brief["date"]
+
+    # When rendering for an email, in-document anchors (#item-1) are stripped by
+    # most clients (Gmail in particular). Resolve them against the public /latest
+    # URL so they jump to the web copy of this issue and scroll to the right
+    # section. When base_url is not provided (e.g. saving the /latest snapshot),
+    # leave plain anchors so they navigate within the same page.
+    link_prefix = f"{base_url.rstrip('/')}/latest" if base_url else ""
 
     masthead = (
         f'<header style="text-align:center;padding:8px 0 32px;border-top:3px solid {RULE};border-bottom:1px solid {RULE};margin-bottom:40px;">'
@@ -140,16 +147,16 @@ def render_brief_email_html(
     if brief["company_items"]:
         toc_rows.append(f'<tr><td style="padding:24px 0 6px;"><div style="font-family:{SANS};font-size:10px;letter-spacing:2.5px;text-transform:uppercase;font-weight:700;color:{MUTED};">What shipped</div><div style="border-bottom:1px solid {RULE};margin-top:6px;"></div></td></tr>')
         for it in brief["company_items"]:
-            toc_rows.append(f'<tr><td style="border-bottom:1px solid {HAIR};padding:14px 0;"><a href="#item-{it["number"]}" style="color:{INK};text-decoration:none;display:block;"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td style="font-family:{SANS};font-size:10px;letter-spacing:2px;color:{MUTED};width:60px;vertical-align:top;padding-top:6px;font-weight:700;">No.{it["number"]:02d}</td><td style="font-family:{SERIF};font-size:18px;line-height:1.35;color:{INK};">{htmllib.escape(it["headline"])}</td></tr></table></a></td></tr>')
+            toc_rows.append(f'<tr><td style="border-bottom:1px solid {HAIR};padding:14px 0;"><a href="{link_prefix}#item-{it["number"]}" style="color:{INK};text-decoration:none;display:block;"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td style="font-family:{SANS};font-size:10px;letter-spacing:2px;color:{MUTED};width:60px;vertical-align:top;padding-top:6px;font-weight:700;">No.{it["number"]:02d}</td><td style="font-family:{SERIF};font-size:18px;line-height:1.35;color:{INK};">{htmllib.escape(it["headline"])}</td></tr></table></a></td></tr>')
 
     if brief["research_items"]:
         toc_rows.append(f'<tr><td style="padding:24px 0 6px;"><div style="font-family:{SANS};font-size:10px;letter-spacing:2.5px;text-transform:uppercase;font-weight:700;color:{MUTED};">Worth knowing</div><div style="border-bottom:1px solid {RULE};margin-top:6px;"></div></td></tr>')
         for it in brief["research_items"]:
-            toc_rows.append(f'<tr><td style="border-bottom:1px solid {HAIR};padding:14px 0;"><a href="#research-{it["number"]}" style="color:{INK};text-decoration:none;display:block;"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td style="font-family:{SANS};font-size:10px;letter-spacing:2px;color:{MUTED};width:60px;vertical-align:top;padding-top:6px;font-weight:700;">R.{it["number"]:02d}</td><td style="font-family:{SERIF};font-size:18px;line-height:1.35;color:{INK};">{htmllib.escape(it["headline"])}</td></tr></table></a></td></tr>')
+            toc_rows.append(f'<tr><td style="border-bottom:1px solid {HAIR};padding:14px 0;"><a href="{link_prefix}#research-{it["number"]}" style="color:{INK};text-decoration:none;display:block;"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td style="font-family:{SANS};font-size:10px;letter-spacing:2px;color:{MUTED};width:60px;vertical-align:top;padding-top:6px;font-weight:700;">R.{it["number"]:02d}</td><td style="font-family:{SERIF};font-size:18px;line-height:1.35;color:{INK};">{htmllib.escape(it["headline"])}</td></tr></table></a></td></tr>')
 
     if brief["build_idea"]:
         toc_rows.append(f'<tr><td style="padding:24px 0 6px;"><div style="font-family:{SANS};font-size:10px;letter-spacing:2.5px;text-transform:uppercase;font-weight:700;color:{MUTED};">Saturday morning</div><div style="border-bottom:1px solid {RULE};margin-top:6px;"></div></td></tr>')
-        toc_rows.append(f'<tr><td style="border-bottom:1px solid {HAIR};padding:14px 0;"><a href="#build" style="color:{INK};text-decoration:none;display:block;font-family:{SERIF};font-size:18px;font-style:italic;">Your 4-hour build this week &rarr;</a></td></tr>')
+        toc_rows.append(f'<tr><td style="border-bottom:1px solid {HAIR};padding:14px 0;"><a href="{link_prefix}#build" style="color:{INK};text-decoration:none;display:block;font-family:{SERIF};font-size:18px;font-style:italic;">Your 4-hour build this week &rarr;</a></td></tr>')
 
     toc = (
         f'<nav id="top" style="margin:0 auto 64px;">'
@@ -157,8 +164,8 @@ def render_brief_email_html(
         f'<table cellpadding="0" cellspacing="0" border="0" width="100%">{"".join(toc_rows)}</table></nav>'
     )
 
-    items_html = "".join(_render_item(it, date, "item", "What shipped", "No.{n:02d}") for it in brief["company_items"])
-    items_html += "".join(_render_item(it, date, "research", "Worth knowing", "Research {n:02d}") for it in brief["research_items"])
+    items_html = "".join(_render_item(it, date, "item", "What shipped", "No.{n:02d}", link_prefix) for it in brief["company_items"])
+    items_html += "".join(_render_item(it, date, "research", "Worth knowing", "Research {n:02d}", link_prefix) for it in brief["research_items"])
 
     build_html = ""
     if brief["build_idea"]:
@@ -167,7 +174,7 @@ def render_brief_email_html(
             f'<section id="build" style="padding:64px 0 32px;border-top:3px solid {RULE};page-break-before:always;">'
             f'{_label("Section · Saturday morning")}'
             f'<h2 style="font-family:{SERIF};font-size:28px;font-weight:400;letter-spacing:-0.5px;margin:14px 0 28px;color:{INK};">Your 4-hour build this week</h2>'
-            f'<div style="font-family:{SERIF};font-size:18px;line-height:1.7;color:#1f1f1f;">{body}</div>{_back_to_top()}</section>'
+            f'<div style="font-family:{SERIF};font-size:18px;line-height:1.7;color:#1f1f1f;">{body}</div>{_back_to_top(link_prefix)}</section>'
         )
 
     unsubscribe_html = ""
