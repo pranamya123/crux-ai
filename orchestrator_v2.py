@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from email_renderer import render_brief_email_html
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ============================================================================
 # CONFIG
@@ -81,6 +81,24 @@ def handle_get_events(session_id: str, agent_name: Optional[str] = None,
         return {"ok": False, "error": str(e)}
 
 
+def _save_latest_issue(subject: str, body_markdown: str, body_html_public: str) -> None:
+    """Persist the latest issue so /latest can serve it on the website."""
+    try:
+        out_dir = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(out_dir, "latest_issue.html"), "w", encoding="utf-8") as f:
+            f.write(body_html_public)
+        with open(os.path.join(out_dir, "latest_issue.md"), "w", encoding="utf-8") as f:
+            f.write(body_markdown)
+        with open(os.path.join(out_dir, "latest_issue_meta.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "subject": subject,
+                "sent_at": datetime.utcnow().isoformat() + "Z",
+            }, f, indent=2)
+        print(f"[issue] Saved latest issue: {subject}", flush=True)
+    except Exception as e:
+        print(f"[issue] Failed to save latest issue: {e}", flush=True)
+
+
 def handle_send_email_smtp(args: dict) -> Dict[str, Any]:
     host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     try:
@@ -91,6 +109,7 @@ def handle_send_email_smtp(args: dict) -> Dict[str, Any]:
     password = os.environ.get("SMTP_PASSWORD")
     from_addr = os.environ.get("SMTP_FROM", user or "")
     recipients_env = os.environ.get("RECIPIENT_EMAILS", "")
+    base_url = os.environ.get("APP_BASE_URL", "http://localhost:5000")
 
     if not user or not password:
         return {"ok": False, "error": "SMTP_USER or SMTP_PASSWORD not set"}
@@ -104,15 +123,13 @@ def handle_send_email_smtp(args: dict) -> Dict[str, Any]:
     subject = args["subject"]
     body_markdown = args["body_markdown"]
 
-    body_html = render_brief_email_html(body_markdown)
-    print(f"[SMTP] Sending to recipients: {recipients}", flush=True)
+    # Save a non-personalised copy for /latest on the public site.
+    public_html = render_brief_email_html(body_markdown)
+    _save_latest_issue(subject, body_markdown, public_html)
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = from_addr
-    msg["To"] = ", ".join(recipients)
-    msg.attach(MIMEText(body_markdown, "plain", "utf-8"))
-    msg.attach(MIMEText(body_html, "html", "utf-8"))
+    print(f"[SMTP] Sending to recipients: {recipients}", flush=True)
+    sent: List[str] = []
+    failures: List[Dict[str, str]] = []
 
     try:
         with smtplib.SMTP(host, port, timeout=30) as server:
@@ -120,11 +137,36 @@ def handle_send_email_smtp(args: dict) -> Dict[str, Any]:
             server.starttls(context=ssl.create_default_context())
             server.ehlo()
             server.login(user, password)
-            server.sendmail(from_addr, recipients, msg.as_string())
-        print(f"[SMTP] Sent successfully to: {recipients}", flush=True)
-        return {"ok": True, "recipients": recipients, "subject": subject}
+            for recipient in recipients:
+                try:
+                    body_html = render_brief_email_html(
+                        body_markdown,
+                        recipient_email=recipient,
+                        base_url=base_url,
+                    )
+                    msg = MIMEMultipart("alternative")
+                    msg["Subject"] = subject
+                    msg["From"] = from_addr
+                    msg["To"] = recipient
+                    msg.attach(MIMEText(body_markdown, "plain", "utf-8"))
+                    msg.attach(MIMEText(body_html, "html", "utf-8"))
+                    server.sendmail(from_addr, [recipient], msg.as_string())
+                    sent.append(recipient)
+                except Exception as e:
+                    failures.append({"recipient": recipient, "error": f"{type(e).__name__}: {e}"})
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    print(f"[SMTP] Sent successfully to: {sent}", flush=True)
+    if failures:
+        print(f"[SMTP] Failed for: {failures}", flush=True)
+
+    return {
+        "ok": len(sent) > 0,
+        "recipients": sent,
+        "failures": failures,
+        "subject": subject,
+    }
 
 
 # ============================================================================

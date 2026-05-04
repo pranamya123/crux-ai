@@ -1,6 +1,7 @@
 """Editorial HTML email rendering (extracted from run.py)."""
 import html as htmllib
 import re
+from urllib.parse import quote
 import markdown as md_lib
 
 SERIF = "'Source Serif Pro', Georgia, 'Times New Roman', serif"
@@ -110,7 +111,11 @@ def _render_item(item, date, anchor_prefix="item", section_label="What shipped",
     )
 
 
-def render_brief_email_html(body_markdown: str) -> str:
+def render_brief_email_html(
+    body_markdown: str,
+    recipient_email: str | None = None,
+    base_url: str | None = None,
+) -> str:
     brief = _parse_brief(body_markdown)
     title = brief["title"]
     date = brief["date"]
@@ -165,7 +170,22 @@ def render_brief_email_html(body_markdown: str) -> str:
             f'<div style="font-family:{SERIF};font-size:18px;line-height:1.7;color:#1f1f1f;">{body}</div>{_back_to_top()}</section>'
         )
 
-    footer = f'<footer style="border-top:1px solid {RULE};margin-top:64px;padding-top:24px;text-align:center;font-family:{SANS};font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:{MUTED};">AI Weekly · {htmllib.escape(date) if date else ""} · End of issue</footer>'
+    unsubscribe_html = ""
+    if recipient_email and base_url:
+        unsub_url = f"{base_url.rstrip('/')}/unsubscribe?email={quote(recipient_email)}"
+        unsubscribe_html = (
+            f'<div style="margin-top:14px;font-family:{SANS};font-size:11px;letter-spacing:1px;text-transform:none;color:{MUTED};">'
+            f'You are subscribed as {htmllib.escape(recipient_email)}. '
+            f'<a href="{htmllib.escape(unsub_url)}" style="color:{MUTED};text-decoration:underline;">Unsubscribe</a>.'
+            f'</div>'
+        )
+
+    footer = (
+        f'<footer style="border-top:1px solid {RULE};margin-top:64px;padding-top:24px;text-align:center;font-family:{SANS};font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:{MUTED};">'
+        f'AI Weekly · {htmllib.escape(date) if date else ""} · End of issue'
+        f'{unsubscribe_html}'
+        f'</footer>'
+    )
 
     return (
         f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
