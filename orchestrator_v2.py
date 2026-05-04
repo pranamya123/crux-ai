@@ -8,6 +8,7 @@ True "many brains, one session" pattern:
 - Subsequent agents read prior events via get_events()
 - Orchestrator handles custom tools: emit_event, get_events, send_email_smtp
 """
+import argparse
 import json
 import os
 import smtplib
@@ -286,13 +287,39 @@ class AgentRunner:
 # ORCHESTRATOR
 # ============================================================================
 class OrchestratorV2:
-    def __init__(self):
+    def __init__(self, resume_session_id: Optional[str] = None):
         self.client = anthropic.Anthropic()
-        self.session_id = f"newsletter_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        if resume_session_id:
+            existing = handle_get_events(session_id=resume_session_id)
+            if existing.get("ok") and existing.get("events"):
+                self.session_id = resume_session_id
+                self.resumed = True
+                event_types = [e["event_type"] for e in existing["events"]]
+                print(f"\n>>> RESUMING session {self.session_id}")
+                print(f"    {len(existing['events'])} prior events: {event_types}")
+            else:
+                print(f"\n>>> No prior events for {resume_session_id}; starting fresh")
+                self.session_id = self._new_session_id()
+                self.resumed = False
+        else:
+            self.session_id = self._new_session_id()
+            self.resumed = False
         self.runner = AgentRunner(self.client, self.session_id)
         print(f"\n{'=' * 70}")
         print(f"SHARED SESSION ID: {self.session_id}")
         print(f"{'=' * 70}")
+
+    @staticmethod
+    def _new_session_id() -> str:
+        return f"newsletter_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+    def _has_event(self, event_type: str) -> bool:
+        result = handle_get_events(session_id=self.session_id, event_type=event_type)
+        return bool(result.get("ok")) and len(result.get("events", [])) > 0
+
+    def _count_events(self, event_type: str) -> int:
+        result = handle_get_events(session_id=self.session_id, event_type=event_type)
+        return len(result.get("events", [])) if result.get("ok") else 0
 
     def step_memory(self):
         return self.runner.run(
@@ -342,34 +369,80 @@ class OrchestratorV2:
     def orchestrate(self):
         print("\n" + "=" * 70)
         print("MULTI-AGENT ORCHESTRATOR V2 - SHARED SESSION")
+        if self.resumed:
+            print("MODE: RESUME (skipping steps whose terminal event already exists)")
         print("=" * 70)
         total_start = time.time()
-        results = {}
+        results: Dict[str, Any] = {}
 
-        results["memory"] = self.step_memory()
-        results["launches"], results["papers"] = self.step_research_parallel()
-        results["evaluator"] = self.step_evaluate()
-        results["writer_v1"] = self.step_write()
-
-        max_retries = 2
-        approved = False
-        for attempt in range(max_retries + 1):
-            results[f"critic_v{attempt + 1}"] = self.step_critique()
-            if self.check_critic_decision():
-                print(f"\n>>> Critic APPROVED on attempt {attempt + 1}", flush=True)
-                approved = True
-                break
-            if attempt < max_retries:
-                print(f"\n>>> Critic REJECTED. Re-running writer...", flush=True)
-                results[f"writer_v{attempt + 2}"] = self.step_write(
-                    retry_msg="Previous draft was rejected. Read critic_rejection event and address all issues."
-                )
-
-        if not approved:
-            print("\n>>> Max retries reached. Stopping.", flush=True)
+        # If the run already completed, exit early.
+        if self._has_event("email_sent"):
+            print("\n>>> Session already completed (email_sent present). Nothing to do.")
             return
 
-        results["delivery"] = self.step_deliver()
+        # ---- Memory ----
+        if self._has_event("covered_topics"):
+            print("\n>>> [resume] Skipping memory — covered_topics already emitted")
+        else:
+            results["memory"] = self.step_memory()
+
+        # ---- Parallel research ----
+        if self._has_event("launches_researched") and self._has_event("papers_researched"):
+            print("\n>>> [resume] Skipping research — both launches & papers already emitted")
+        else:
+            results["launches"], results["papers"] = self.step_research_parallel()
+
+        # ---- Evaluator ----
+        if self._has_event("items_evaluated"):
+            print("\n>>> [resume] Skipping evaluator — items_evaluated already emitted")
+        else:
+            results["evaluator"] = self.step_evaluate()
+
+        # ---- Writer / Critic loop, state-driven so it resumes correctly ----
+        max_retries = 2
+        approved = self._has_event("draft_approved")
+        if approved:
+            print("\n>>> [resume] Draft already approved — skipping writer/critic")
+
+        # Loop driven by counts of draft_written vs critic_rejection events.
+        # If they're equal, the latest action was a rejection (or no draft yet)
+        # and we need a new writer pass. If drafts > rejections, a fresh draft
+        # is awaiting critique.
+        loop_safety = 0
+        while not approved and loop_safety < 10:
+            loop_safety += 1
+            drafts = self._count_events("draft_written")
+            rejections = self._count_events("critic_rejection")
+
+            if drafts == 0 or rejections >= drafts:
+                # Need to write (initial or after rejection)
+                if drafts > max_retries:
+                    print(f"\n>>> Max writer retries ({max_retries}) reached. Stopping.")
+                    break
+                attempt = drafts + 1
+                retry_msg = ("Previous draft was rejected. Read critic_rejection event "
+                             "and address all issues.") if drafts > 0 else ""
+                print(f"\n>>> Writer attempt {attempt}")
+                results[f"writer_v{attempt}"] = self.step_write(retry_msg=retry_msg)
+                continue
+
+            # drafts > rejections: a fresh draft is waiting for the critic
+            attempt = rejections + 1
+            print(f"\n>>> Critic attempt {attempt}")
+            results[f"critic_v{attempt}"] = self.step_critique()
+            if self.check_critic_decision():
+                print(f"\n>>> Critic APPROVED on attempt {attempt}")
+                approved = True
+
+        if not approved:
+            print("\n>>> Did not reach approval. Stopping before delivery.")
+            return
+
+        # ---- Delivery ----
+        if self._has_event("email_sent"):
+            print("\n>>> [resume] Email already sent — done")
+        else:
+            results["delivery"] = self.step_deliver()
 
         total = time.time() - total_start
         print("\n" + "=" * 70)
@@ -382,6 +455,7 @@ class OrchestratorV2:
         with open(log_path, "w") as f:
             json.dump({
                 "session_id": self.session_id,
+                "resumed": self.resumed,
                 "total_elapsed": total,
                 "approved": approved,
                 "agents": {n: {k: v for k, v in r.items() if k != "output"}
@@ -390,5 +464,20 @@ class OrchestratorV2:
         print(f"\nLog saved: {log_path}")
 
 
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Multi-Agent Newsletter Orchestrator (shared session pattern).",
+    )
+    parser.add_argument(
+        "--session-id",
+        dest="session_id",
+        default=None,
+        help="Resume an existing newsletter session by id (e.g. newsletter_20260504_160649_80879d6e). "
+             "Reads session_events from Supabase and skips any step whose terminal event is already present.",
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    OrchestratorV2().orchestrate()
+    args = _parse_args()
+    OrchestratorV2(resume_session_id=args.session_id).orchestrate()
