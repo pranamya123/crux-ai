@@ -1,22 +1,18 @@
 from flask import Flask, render_template, request, jsonify
-import json
 import os
-from datetime import datetime
 import re
+from supabase import create_client, Client
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 
-SUBSCRIBERS_FILE = 'subscribers.json'
+# Initialize Supabase
+SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL") or os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("ANON_KEY")
 
-def load_subscribers():
-    if os.path.exists(SUBSCRIBERS_FILE):
-        with open(SUBSCRIBERS_FILE, 'r') as f:
-            return json.load(f)
-    return []
-
-def save_subscribers(subscribers):
-    with open(SUBSCRIBERS_FILE, 'w') as f:
-        json.dump(subscribers, f, indent=2)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def is_valid_email(email):
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
@@ -37,41 +33,51 @@ def subscribe():
     if not is_valid_email(email):
         return jsonify({'error': 'Invalid email format'}), 400
 
-    subscribers = load_subscribers()
+    try:
+        # Check if email already exists
+        response = supabase.table('subscribers').select('id').eq('email', email).execute()
 
-    if email in subscribers:
-        return jsonify({'error': 'Already subscribed'}), 400
+        if response.data:
+            return jsonify({'error': 'Already subscribed'}), 400
 
-    subscribers.append(email)
-    subscribers.sort()
-    save_subscribers(subscribers)
+        # Insert new subscriber
+        supabase.table('subscribers').insert({'email': email}).execute()
+        return jsonify({'success': True, 'message': 'Subscribed successfully'}), 201
 
-    return jsonify({'success': True, 'message': 'Subscribed successfully'}), 201
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return jsonify({'error': 'Something went wrong'}), 500
 
 @app.route('/admin', methods=['GET'])
 def admin():
-    subscribers = load_subscribers()
-    emails_text = '\n'.join(subscribers) if subscribers else 'No subscribers yet.'
-    return f'''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>AI Weekly - Subscribers</title>
-        <style>
-            body {{ font-family: system-ui; max-width: 800px; margin: 40px auto; padding: 20px; }}
-            h1 {{ color: #333; }}
-            textarea {{ width: 100%; height: 300px; font-family: monospace; border: 1px solid #ddd; padding: 10px; }}
-            .count {{ color: #666; font-size: 0.9em; }}
-        </style>
-    </head>
-    <body>
-        <h1>AI Weekly Subscribers</h1>
-        <p class="count">Total: {len(subscribers)} subscribers</p>
-        <textarea readonly>{emails_text}</textarea>
-        <p style="color: #999; font-size: 0.85em;">Copy these emails to your .env RECIPIENT_EMAILS on Wednesday before the Thursday send.</p>
-    </body>
-    </html>
-    '''
+    try:
+        response = supabase.table('subscribers').select('email').order('email').execute()
+        subscribers = [row['email'] for row in response.data]
+        emails_text = '\n'.join(subscribers) if subscribers else 'No subscribers yet.'
+
+        return f'''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>AI Weekly - Subscribers</title>
+            <style>
+                body {{ font-family: system-ui; max-width: 800px; margin: 40px auto; padding: 20px; }}
+                h1 {{ color: #333; }}
+                textarea {{ width: 100%; height: 300px; font-family: monospace; border: 1px solid #ddd; padding: 10px; }}
+                .count {{ color: #666; font-size: 0.9em; }}
+            </style>
+        </head>
+        <body>
+            <h1>AI Weekly Subscribers</h1>
+            <p class="count">Total: {len(subscribers)} subscribers</p>
+            <textarea readonly>{emails_text}</textarea>
+            <p style="color: #999; font-size: 0.85em;">Copy these emails to your .env RECIPIENT_EMAILS on Wednesday before the Thursday send.</p>
+        </body>
+        </html>
+        '''
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return "Error loading subscribers", 500
 
 if __name__ == '__main__':
     app.run(debug=True)
