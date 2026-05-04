@@ -392,6 +392,29 @@ class OrchestratorV2:
         else:
             results["launches"], results["papers"] = self.step_research_parallel()
 
+        # Post-condition: belt-and-suspenders. The Evaluator blocks on both
+        # terminal events existing. If a research agent silently exited without
+        # emitting (observed: Papers agent did this in 2 of 3 early runs), insert
+        # an empty placeholder so the pipeline can proceed and so the failure is
+        # visible in the briefs log rather than silent.
+        for required, key in (("launches_researched", "launches"),
+                               ("papers_researched", "papers")):
+            if not self._has_event(required):
+                print(f"\n>>> WARNING: {required} missing after research step. "
+                      f"Inserting empty placeholder so Evaluator can proceed.",
+                      flush=True)
+                handle_emit_event(
+                    session_id=self.session_id,
+                    agent_name="orchestrator",
+                    event_type=required,
+                    data={
+                        key: [],
+                        "note": "Auto-inserted by orchestrator: research agent did not emit a terminal event.",
+                        "auto_inserted": True,
+                    },
+                )
+                results.setdefault("auto_inserted_events", []).append(required)
+
         # ---- Evaluator ----
         if self._has_event("items_evaluated"):
             print("\n>>> [resume] Skipping evaluator — items_evaluated already emitted")
