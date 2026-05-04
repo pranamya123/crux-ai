@@ -1,0 +1,42 @@
+{
+  "session_id": "newsletter_20260504_142629_6b9a9457",
+  "total_elapsed": 525.3959140777588,
+  "approved": true,
+  "agents": {
+    "memory": {
+      "agent_session_id": "sesn_011Cai5W2m854Rkp8sYoS5UL",
+      "elapsed": 15.371661186218262,
+      "tool_calls": 1
+    },
+    "launches": {
+      "agent_session_id": "sesn_011Cai5XA4C5z8YynBevQL4Y",
+      "elapsed": 105.20336508750916,
+      "tool_calls": 1
+    },
+    "papers": {
+      "agent_session_id": "sesn_011Cai5XADMxwLpYUEoPVck2",
+      "elapsed": 130.28820991516113,
+      "tool_calls": 1
+    },
+    "evaluator": {
+      "agent_session_id": "sesn_011Cai5gmRwjDYFfbeqZMDaD",
+      "elapsed": 35.0182991027832,
+      "tool_calls": 2
+    },
+    "writer_v1": {
+      "agent_session_id": "sesn_011Cai5jLwrvawW8YVieiqXn",
+      "elapsed": 168.3643889427185,
+      "tool_calls": 3
+    },
+    "critic_v1": {
+      "agent_session_id": "sesn_011Cai5wkqtPFYwNQDD4t9pj",
+      "elapsed": 132.69169688224792,
+      "tool_calls": 2
+    },
+    "delivery": {
+      "agent_session_id": "sesn_011Cai67YtL9i4qYfMpfD6SV",
+      "elapsed": 43.50639581680298,
+      "tool_calls": 3
+    }
+  }
+}
