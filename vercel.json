@@ -1,14 +1,3 @@
 {
-  "version": 2,
-  "functions": {
-    "api/orchestrate.py": {
-      "maxDuration": 10
-    },
-    "api/step.py": {
-      "maxDuration": 60
-    },
-    "api/status.py": {
-      "maxDuration": 10
-    }
-  }
+  "version": 2
 }
