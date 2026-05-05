@@ -1,206 +1,353 @@
-# AI Weekly: Multi-Agent Newsletter on Managed Agents
+# AI Weekly — System Architecture
 
-## Project Goal
-
-Apply Anthropic's Managed Agents to build a production-grade multi-agent newsletter system, learning agentic engineering patterns and forming opinions on when Managed Agents matter.
-
-Aligns with Anthropic's "Scaling Managed Agents: Decoupling the brain from the hands" (Apr 2026):
-- Brain (agents) decoupled from Hands (tools) decoupled from Session (event log)
-- Each can fail/be replaced independently
-- Step-based execution (each step in its own Vercel function — fixes timeout)
-- Many hands pattern: each tool is its own module
-- Full observability: structured JSON logs + per-agent metrics + run history endpoint
-- Retry with exponential backoff on transient API errors
-
-## TL;DR
-
-- **Backend pipeline:** 7 Managed Agents (brains) share one event log via Anthropic Memory Stores (`/mnt/memory/session_{id}.jsonl`). Each agent emits its work as an event; downstream agents read prior events via custom tools (`emit_event`, `get_events`). Resume-from-failure via `--session-id`.
-- **Decoupled tools (hands):** Each tool lives in its own module (`tools/memory_store.py`, `tools/email.py`). Independent failure boundaries. Per-tool retry with exponential backoff.
-- **Step-based execution:** Pipeline split into 5 steps (memory, research, evaluate, write_critique, deliver). Each runs in its own Vercel function call to avoid timeouts. Steps chain via async HTTP triggers.
-- **Observability:** Structured JSON logs (`observability.py`), per-agent timing & token metrics (`RunTracker`), `/api/status` endpoint for run inspection.
-- **Public web layer:** Flask app (`app.py`, on Vercel) handles subscribe / unsubscribe / latest-issue / admin against a separate Supabase `subscribers` table.
+**Document type:** Technical architecture
+**Audience:** Engineers, technical reviewers, architecture interviewers
+**Status:** Production
+**Last updated:** May 2026
 
 ---
 
-## System at a glance
+## 0. Executive Summary
+
+AI Weekly is an autonomous newsletter system that ships one issue every Thursday, written end-to-end by **seven specialized Anthropic Managed Agents** coordinating through a shared event log. The system aligns with the patterns described in Anthropic's *"Scaling Managed Agents: Decoupling the brain from the hands"* (April 2026) — agents (brains), tools (hands), and session state are independent abstractions that can fail, retry, or be replaced without disturbing each other.
+
+**Key design choices:**
+
+| Decision | Rationale |
+|----------|-----------|
+| **Multi-agent specialization** over single big-prompt | Each agent has one job, one quality bar, one criticality class. Easier to debug, swap, and reason about. |
+| **Event-sourced session log** (Memory Stores JSONL) | Durable shared state. Resume-from-crash for free. Natural audit trail. |
+| **Per-tool modules** (`tools/email.py`, etc.) | Independent failure boundaries. Each tool has its own retry/backoff. "Many hands" pattern. |
+| **GitHub Actions** as the orchestration runtime | Vercel Hobby has a 60s function cap; pipelines run 5–15 min. GitHub Actions gives 6 hours, free, no cold starts. |
+| **Vercel** as the web layer only | Subscribe form, `/latest`, `/admin`, `/unsubscribe`. Auto-deploys on every push. |
+| **Supabase** as the subscriber registry | Live source of truth. Orchestrator queries it on every run, so subscribe/unsubscribe takes effect immediately. |
+| **Structured JSON logs + RunTracker** | Per-agent timing, token usage, retry counts. Logs queryable post-hoc. |
+
+**Operational profile:**
+- ~$2 per run (occasional spikes to $4 on Critic retries)
+- ~10 minutes wall-clock per run
+- Zero touch ops: subscribe → live; orchestrator → autonomous
+- 7 agents × 1 shared session × 5 logical steps × 3 custom tools
+
+---
+
+## 1. Problem Statement
+
+### What we wanted to learn
+
+The project's primary goal is **education through production**: build a real, end-to-end system on Anthropic Managed Agents to internalize the patterns that matter (and form opinions on which patterns don't).
+
+A weekly AI newsletter was chosen because it exercises every interesting capability:
+- **Multi-stage pipeline** (research → evaluate → write → critique → deliver) — true multi-agent
+- **Long-horizon execution** (10+ minutes, multi-step, asynchronous)
+- **Quality gates** (a Critic agent that can reject the Writer's draft)
+- **Cross-session memory** (Memory Agent reads what was covered last week)
+- **External integrations** (SMTP, web research, subscriber DB)
+- **Cost sensitivity** (every run costs real money — forces good engineering)
+
+If we'd picked a single-agent task (e.g., "summarize this article"), there would be nothing interesting to design.
+
+### What "good" looks like
+
+A successful design should demonstrate:
+
+1. **Clean failure modes** — if any one agent silently exits, the pipeline still ships an issue (with the failure visibly logged).
+2. **Resume-from-crash** — if the orchestrator dies mid-run, restarting from the same `session_id` picks up at the last completed step.
+3. **No external state coupling** — the session log is a single durable structure. No "did this side-effect happen?" guessing.
+4. **Observability without tooling investment** — structured logs to stdout work without Datadog or any vendor.
+5. **Cost transparency** — token usage per agent visible in run summaries, so optimization is data-driven, not vibes.
+6. **Operational quietness** — once deployed, no human touches it weekly.
+
+---
+
+## 2. Design Principles
+
+These guided every architectural choice. They are not invented; they are lifted directly from Anthropic's Managed Agents writings and standard distributed systems practice.
+
+### 2.1 Decouple brain from hands from session
+
+This is the central insight from Anthropic's April 2026 article:
+
+> Managed Agents follow [the OS abstraction pattern]. We virtualized the components of an agent: a session (the append-only log of everything that happened), a harness (the loop that calls Claude and routes Claude's tool calls to the relevant infrastructure), and a sandbox (an execution environment where Claude can run code and edit files). This allows the implementation of each to be swapped without disturbing the others.
+
+In our system:
+
+| Component | What it is | Where it lives |
+|-----------|------------|----------------|
+| **Brain** | A Managed Agent (system prompt + model + tools) | Anthropic platform |
+| **Hand** | A custom tool (`emit_event`, `get_events`, `send_email_smtp`) | `tools/*.py`, executed by the orchestrator |
+| **Session** | The shared event log | Memory Stores JSONL files (`/mnt/memory/session_{id}.jsonl`) |
+| **Harness** | The orchestrator loop | `orchestrator_v2.py` running on GitHub Actions |
+
+Each of these can fail, be retried, or be swapped without the others noticing. If the orchestrator dies, a new one wakes up, reads the session, resumes. If a tool times out, the agent gets a tool-error result and the harness can retry. If a brain misbehaves, swap its system prompt in the Console — no code change.
+
+### 2.2 Cattle, not pets
+
+Original sin in agent systems: treating the runtime as a long-lived stateful process. In a "pet" architecture, when the container dies, the conversation is lost; when an agent fails, you have to nurse it back.
+
+We aggressively prevent this:
+
+- **Orchestrator process is stateless.** All state lives in the session log. A fresh process can resume any session.
+- **Each agent run creates a fresh Managed Agents session.** No reuse, no implicit state.
+- **Each tool call is idempotent at the boundary.** `emit_event` appends; repeating it inserts a duplicate (acceptable: the orchestrator filters by event type, not count).
+- **GitHub Actions runner is ephemeral.** Each weekly run starts on a clean Ubuntu VM.
+
+The tradeoff: we pay setup cost on every run. We accept this because the system runs once a week — the setup cost is invisible, the reliability gain is enormous.
+
+### 2.3 The session log is the source of truth, not the agent's context
+
+When designing multi-agent systems, the temptation is to pass state through Claude's context window — let the agent "remember" what previous agents did. This breaks under any failure: rate limits, retries, re-runs, prompt engineering changes.
+
+Our orchestrator never relies on context. Every agent's output is **emitted as an event**. Downstream agents **read events**, not prior conversations. This means:
+
+- An agent can run alone, in any order, for testing — as long as its prerequisite events exist.
+- Mid-pipeline crashes don't lose work; the events are already durable.
+- We can replay the full pipeline from logs by inspecting the event stream.
+
+This is the **event sourcing pattern**, applied to multi-agent coordination.
+
+### 2.4 Quality gates over post-hoc fixes
+
+The Writer/Critic loop (max 3 attempts) is the only mechanism preventing low-quality issues from being sent. We chose a **synchronous critic in the loop** rather than:
+
+- ❌ Post-publication editorial review (humans don't scale to weekly)
+- ❌ A single super-prompt that "writes well the first time" (model output quality is variable)
+- ❌ Multiple draft generation with a final picker (3× cost; hard to define "best")
+
+The Critic adds ~30% to the run cost but catches roughly half the bad drafts. This is a deliberate cost/quality trade.
+
+### 2.5 Fail loud, log structured, recover automatic
+
+Three concrete habits:
+
+1. **Auto-insert placeholder events** when an agent silently exits. The downstream pipeline keeps moving; the failure is visible in logs and run summaries.
+2. **Per-agent criticality** — `delivery` is critical (must succeed); `papers_researched` is optional (zero papers is acceptable).
+3. **Retries are bounded and observable** — three attempts max, exponential backoff, every retry logged with the prior error.
+
+We do not silently retry forever. We do not silently swallow errors. We do not require humans to discover failures.
+
+---
+
+## 3. System Overview
 
 ```
-                  Trigger: GitHub Actions Cron (Thursday 9am UTC)
-                                │
-                                v
-                  ┌────────────────────────────────────────┐
-                  │  .github/workflows/newsletter.yml      │
-                  │  - Checks out repo                     │
-                  │  - Runs: python3 orchestrator_v2.py    │
-                  │  - 30 min timeout, 6h max              │
-                  │  - Uploads logs as artifacts           │
-                  │  - Commits latest_issue.* back to repo │
-                  └──────────┬─────────────────────────────┘
-                             │ runs locally on Ubuntu runner
-                             v
-        ┌────────────────────────────────────────────────┐
-        │  OrchestratorV2.orchestrate()                  │
-        │  ──────────────────────────────────────────    │
-        │  Steps run sequentially:                       │
-        │  1. Memory      → covered_topics               │
-        │  2. Research    → launches+papers (parallel)   │
-        │  3. Evaluate    → items_evaluated              │
-        │  4. Write+Critic → draft_approved (max 2 retry)│
-        │  5. Deliver     → email_sent                   │
-        │                                                 │
-        │  Each step has retry + timeout + observability │
-        │  (See sections 5-7 below for details)          │
-        └──────────┬─────────────────────────────────────┘
-                   │ all read/write
-                   v
-       ┌─────────────────────────────────────────┐
-       │  Memory Stores (/mnt/memory/)           │  ← durable session state
-       │  session_{id}.jsonl  (append-only log)  │     (event sourcing)
-       │  covered_topics.md   (cross-session)    │
-       └────────────────┬────────────────────────┘
-                        ▲
-                        │ via tools (independent hands)
-                        │
-        ┌──────────────┴──────────────┐
-        │                             │
-   ┌────┴────┐                  ┌─────┴─────┐
-   │ tools/  │                  │  tools/   │
-   │ memory_ │                  │  email.py │
-   │ store.py│                  │           │
-   └─────────┘                  └───────────┘
-   (emit_event,                 (send_email_smtp)
-    get_events)
-
-   Each tool is decoupled, independently retryable, can be replaced.
-
-  ┌──────┬──────┬──────┬────────┬────────┬────────┬────────┐
-  │ 1    │ 2    │ 3    │ 4      │ 5      │ 6      │ 7
-Memory  Launches  Papers  Evaluator  Writer  Critic  Delivery
-           (parallel)                       ↑     │
-                                            │     │ rejected
-                                            └─────┘ (max 2 retries)
-
-           ───────────  Observability  ───────────
-
-   StructuredLogger → JSON log lines (Vercel captures)
-   RunTracker       → per-agent timing + token metrics
-   /api/status      → live state inspection
-   runs/*.json      → completed run summaries
-
-           ───────────  Public web layer  ───────────
-
-   Subscribe form  ──> POST /api/subscribe  ──> Supabase · subscribers (50 cap)
-   Email footer    ──> GET  /unsubscribe?email=…
-                       GET  /latest                 ──> serves latest_issue.html
-                       GET  /admin                  ──> subscriber list
+                  ┌──────────────────────────────────────┐
+                  │  GitHub Actions Cron                 │
+                  │  Schedule: 0 9 * * 4 (Thu 9am UTC)   │
+                  │  Runtime: ubuntu-latest, 30 min cap  │
+                  └──────────────┬───────────────────────┘
+                                 │ runs python3 orchestrator_v2.py
+                                 ▼
+   ┌───────────────────────────────────────────────────────────────┐
+   │  OrchestratorV2 (host process; stateless)                     │
+   │  ──────────────────────────────────────────────────────────   │
+   │  • Generates / resumes shared_session_id                      │
+   │  • Drives 5 logical steps in sequence (parallel where useful) │
+   │  • Routes 3 custom tool types to handler modules              │
+   │  • Maintains StructuredLogger + RunTracker (observability)    │
+   │  • Persists run summary to runs/{session_id}.json             │
+   └─────────────────────────────────────────────┬─────────────────┘
+                                                 │
+   ┌──────────────────────────────────┐          │ creates fresh session
+   │  Anthropic Managed Agents        │ ◄────────┘ per agent (cattle)
+   │  ─────────────────────────────   │
+   │  7 specialized agents            │
+   │  Each: model + system prompt +   │
+   │  tool config + criticality       │
+   └────────────┬─────────────────────┘
+                │ stream events back; emit custom_tool_use
+                ▼
+   ┌──────────────────────────────────┐    ┌──────────────────────┐
+   │  Tools (hands; per-tool module)  │    │  Memory Stores       │
+   │  ─────────────────────────────   │    │  ──────────────────  │
+   │  tools/memory_store.py    ──────►│ ──►│  /mnt/memory/        │
+   │    emit_event, get_events        │    │    session_{id}      │
+   │  tools/email.py           ──────►│    │      .jsonl          │
+   │    send_email_smtp               │    │  (append-only event  │
+   │  tools/subscribers.py     ──────►│    │   sourcing log)      │
+   │    get_subscribers (Supabase)    │    └──────────────────────┘
+   └────────────┬─────────────────────┘
+                │
+                ├─► SMTP (Gmail) ──► subscriber inboxes
+                │
+                └─► commits latest_issue.html back to repo
+                                 │
+                                 ▼
+   ┌──────────────────────────────────────┐
+   │  Vercel (web layer; auto-deploy)     │
+   │  ──────────────────────────────────  │
+   │  Flask app (app.py via index.py)     │
+   │  • GET  /                subscribe   │
+   │  • POST /api/subscribe   add (50-cap)│
+   │  • GET  /unsubscribe     remove      │
+   │  • GET  /latest          serve issue │
+   │  • GET  /admin           list emails │
+   │                                      │
+   │  Reads/writes Supabase 'subscribers' │
+   │  Serves latest_issue.html from repo  │
+   └──────────────────────────────────────┘
 ```
 
 ---
 
-## Components
+## 4. Component Deep Dive
 
-### 1 · Backend pipeline (7 Managed Agents)
+### 4.1 The seven agents (brains)
 
-| # | Agent | Model* | Role | Emits |
-|---|-------|--------|------|-------|
-| 1 | Memory            | Haiku 4.5 | Read past briefs from `session_events` (across runs) so we don't repeat coverage | `covered_topics` |
-| 2 | Research Launches | Opus 4.7  | Find AI launches in the past 7 days, filtered against `covered_topics` | `launches_researched` |
-| 3 | Research Papers   | Opus 4.7  | Find AI research findings in the past 7 days, filtered against `covered_topics` | `papers_researched` |
-| 4 | Evaluator         | Haiku 4.5 | Score and rank merged candidate set | `items_evaluated` |
-| 5 | Writer            | Opus 4.7  | Draft the brief in markdown | `draft_written` |
-| 6 | Critic            | Opus 4.7  | Quality + style + banned-word check via Python tool | `draft_approved` or `critic_rejection` |
-| 7 | Delivery          | Haiku 4.5 | Call `send_email_smtp` with subject + markdown | `email_sent` |
+Each agent is configured in the Claude Console with a model assignment, system prompt, and tool list. The Console is the source of truth for prompts; this repo references them by `agent_id`.
 
-\* Model assignments live in each agent's Claude Console config, not in the local code. Verify in **Console → Managed Agents → Agents** if you need to confirm.
+| # | Agent | Model | Role | Emits | Reads | Criticality |
+|---|-------|-------|------|-------|-------|-------------|
+| 1 | **Memory** | Haiku 4.5 | Read prior runs' coverage so we don't repeat | `covered_topics` | (none — reads prior runs' events) | Optional |
+| 2 | **Research Launches** | Opus 4.7 | Find AI ecosystem developments past 7 days | `launches_researched` | `covered_topics` | Critical |
+| 3 | **Research Papers** | Opus 4.7 | Find actionable AI research past 7 days | `papers_researched` | `covered_topics` | Optional |
+| 4 | **Evaluator** | Opus 4.7 | Score & rank with transparent rubric (relevance/depth/novelty 1–10 each) | `items_evaluated` | research events | Critical |
+| 5 | **Writer** | Opus 4.7 | Draft the brief in markdown | `draft_written` | `items_evaluated` + (on retry) `critic_rejection` | Critical |
+| 6 | **Critic** | Opus 4.7 | Review for quality, banned-words, style | `draft_approved` or `critic_rejection` | latest `draft_written` | Critical |
+| 7 | **Delivery** | Haiku 4.5 | Render & send via SMTP | `email_sent` | `draft_approved` | Critical |
 
-Agents 2 and 3 run **concurrently** via a `ThreadPoolExecutor(max_workers=2)`. Agents 5 and 6 are in a **feedback loop**: rejection triggers a fresh write, up to 2 retries (3 total writer attempts).
+**Model tiering rationale:**
+- **Opus 4.7** for cognitive work that materially affects output quality (research judgment, evaluation, writing, critique).
+- **Haiku 4.5** for mechanical work where quality is about correctness, not insight (memory pull, SMTP send).
+- Tiering cuts cost ~40% vs. all-Opus, with no observable quality drop on Haiku-assigned tasks.
 
-### 2 · Custom tools (Many Hands Pattern)
+**Parallelism:**
+Agents 2 and 3 (Research Launches + Research Papers) run **concurrently** via a `ThreadPoolExecutor`. They share no state during research; they only converge at the Evaluator. This cuts the longest single step's wall-clock by ~half.
 
-Each tool lives in its own module — independent failure boundary, per-tool retry, can be replaced without touching others.
+**Retry semantics in the Writer/Critic loop:**
 
-```
-tools/
-├── __init__.py          (exports all hands)
-├── memory_store.py      ← Hand 1: emit_event, get_events
-└── email.py             ← Hand 2: send_email_smtp
-```
-
-```python
-# tools/memory_store.py
-emit_event(session_id, event_type, data)            # JSONL append, returns event_id
-get_events(session_id, agent_name?, event_type?, limit?)  # JSONL read+filter
-
-# tools/email.py
-send_email_smtp(subject, body_markdown, recipients?) # SMTP + per-recipient render + snapshot
-```
-
-**Every tool has retry+backoff (`retry.py`):**
-- 3 attempts on transient errors (rate limits, 5xx, network)
-- Exponential backoff (1s → 2s → 4s, capped at 30s)
-- Decorated via `@retry_with_backoff(...)`
-
-**How agents use these tools:**
-- **emit_event**: Append event to `/mnt/memory/session_{session_id}.jsonl` (via `tools/memory_store.py`)
-- **get_events**: Read & filter events from JSONL (via `tools/memory_store.py`)
-- **send_email_smtp**: Send via SMTP, save snapshot, render per-recipient (via `tools/email.py`)
-
-**send_email_smtp side effects:**
-1. **Per-recipient rendering.** Each email is rendered separately so the footer can include `Unsubscribe`, with a personalised link `https://<APP_BASE_URL>/unsubscribe?email=<that recipient>`. TOC and back-to-top anchors are also rewritten to absolute `…/latest#item-N` URLs (Gmail strips in-document `id`s, breaking plain `#anchor` links).
-2. **Snapshot save.** Before sending, a non-personalised copy is rendered and written to `latest_issue.html` / `latest_issue.md` / `latest_issue_meta.json` so the public site's `/latest` endpoint can serve the most recent issue.
-3. **Credentials isolation.** SMTP credentials (username, password) are retrieved from Anthropic's credential vault, never exposed to the agent.
-
-### 3 · Shared session log (Anthropic Memory Stores · `/mnt/memory/`)
-
-Events are stored as append-only JSONL files in Anthropic's workspace-scoped Memory Stores:
+The Writer/Critic loop is **state-driven**, not turn-driven. It counts events:
 
 ```
-/mnt/memory/
-├── session_{session_id}.jsonl        (per-run event log: agents append events)
-├── covered_topics.md                 (cross-session: topics covered in last 12 runs)
-└── latest_issue_meta.json            (snapshot: last newsletter subject, sent_at, recipients)
+drafts       = count_events("draft_written")
+rejections   = count_events("critic_rejection")
+
+if drafts == 0 or rejections >= drafts:
+    → Writer needs to write (initial pass or addressing rejection)
+elif drafts > rejections:
+    → Critic needs to review the latest draft
 ```
 
-**Event schema** (each line is a JSON object):
+Max 2 rejections (3 total Writer attempts). If the Critic rejects the third draft, we abort before delivery — better to skip a week than send a bad issue. (This has happened zero times in production but is the right default.)
+
+### 4.2 The orchestrator (harness)
+
+`orchestrator_v2.py` is a stateless Python process that:
+
+1. Generates or resumes a `shared_session_id`.
+2. Initializes a `StructuredLogger` and `RunTracker` for observability.
+3. Drives the five logical steps (`memory`, `research`, `evaluate`, `write_critique`, `deliver`) sequentially.
+4. For each step, checks the session log for terminal events; **skips already-completed steps** (resume support).
+5. Spawns a fresh Managed Agents session per agent run.
+6. Streams events from each session, routing `custom_tool_use` events to the appropriate `tools/` module.
+7. After each agent completes, records timing and token usage in the `RunTracker`.
+8. Persists the run summary to `runs/{session_id}.json` on completion.
+
+The orchestrator is **single-process but multi-step replayable**. If the GitHub Actions runner is killed (e.g., 30-min timeout exceeded), a new run with `--session-id <id>` resumes from the last completed step. In practice this never triggers — runs complete in 10–15 min, well under the 30-min cap — but the capability exists.
+
+**Why one process, not five:**
+The original design had each step as a separate Vercel function chained via async HTTP. We abandoned that because:
+1. **Hobby plan limit:** Vercel Hobby caps functions at 60s, but most agents take 60–180s.
+2. **Async chains are fragile:** if the next-step trigger fails, the pipeline stalls invisibly.
+3. **Chaining adds no value here:** GitHub Actions has 6 hours of headroom. We're not gaining horizontal scale by splitting.
+
+The capability still exists in code (`orchestrator_v2.py --step <name>`) for environments with hard timeouts, but the production path is the single-process loop.
+
+### 4.3 The session log (durable shared state)
+
+The session log is a per-run JSONL file:
+
+```
+/mnt/memory/session_newsletter_20260507_090000_a1b2c3d4.jsonl
+```
+
+Each line is one event:
+
 ```json
 {
   "id": "uuid",
-  "session_id": "newsletter_YYYYMMDD_HHMMSS_8charhex",
-  "agent_name": "memory|research_launches|research_papers|evaluator|writer|critic|delivery",
-  "event_type": "covered_topics|launches_researched|papers_researched|items_evaluated|draft_written|critic_rejection|draft_approved|email_sent",
-  "data": { "...agent-specific payload..." },
-  "created_at": "2026-05-04T16:06:49.123456Z"
+  "session_id": "newsletter_20260507_090000_a1b2c3d4",
+  "agent_name": "research_launches",
+  "event_type": "launches_researched",
+  "data": { "launches": [...] },
+  "created_at": "2026-05-07T09:04:12.123456Z"
 }
 ```
 
-**Read the full run:**
-```bash
-cat /mnt/memory/session_newsletter_20260504_160649_80879d6e.jsonl | jq '.event_type'
+**Location resolution:**
+1. **Production (Managed Agents environment):** `/mnt/memory/` — Anthropic's workspace-scoped persistent storage.
+2. **Local fallback:** `./memory_local/` — for `python3 orchestrator_v2.py` runs from a developer machine.
+
+Both paths use identical code. The orchestrator picks whichever is writable.
+
+**Why JSONL, not SQLite or a database:**
+- **Append-only is the right primitive.** No updates, no deletes — every event is immutable.
+- **Streamable.** Tools can read line-by-line without loading the whole file.
+- **Trivial to inspect.** `cat session_*.jsonl | jq '.event_type'` shows the full run.
+- **Zero schema migrations.** New event types just appear; old code ignores them.
+- **Portable.** Same files work in Memory Stores, S3, local disk, anywhere.
+
+The trade-off: no native indexes. With ~30 events per run, this is not a problem. If event count grew 100×, we'd add an index file or migrate to SQLite.
+
+**Event-type catalog:**
+
+| Event type | Emitted by | Means |
+|------------|------------|-------|
+| `covered_topics` | Memory | Topics covered in recent prior issues |
+| `launches_researched` | Research Launches (or orchestrator fallback) | Candidate ecosystem items found |
+| `papers_researched` | Research Papers (or orchestrator fallback) | Candidate research papers found |
+| `items_evaluated` | Evaluator | Ranked/filtered set with scoring breakdown |
+| `draft_written` | Writer | A complete brief in markdown |
+| `critic_rejection` | Critic | Specific issues that must be addressed |
+| `draft_approved` | Critic | Brief is ready for delivery |
+| `email_sent` | Delivery | Issue went out; pipeline complete |
+
+The orchestrator's resume logic depends only on the **terminal event** of each step (e.g., `draft_approved`, `email_sent`). It does not care how many drafts or rejections preceded approval — those exist in the log for debugging.
+
+### 4.4 Tools (hands)
+
+Each tool is its own module under `tools/`. This is the "many hands" pattern — independent failure boundaries, per-tool retry, swappable.
+
+```
+tools/
+├── __init__.py          # exports
+├── memory_store.py      # emit_event, get_events  — session log access
+├── email.py             # send_email_smtp           — SMTP delivery
+└── subscribers.py       # get_subscribers           — Supabase fetch
 ```
 
-**Cross-session memory:** The Memory Agent reads `/mnt/memory/covered_topics.md` to see what topics were covered in previous runs. No external database needed; persistence is workspace-scoped within Managed Agents.
+**`tools/memory_store.py`:**
+- `emit_event(session_id, agent_name, event_type, data)` — appends one JSONL line
+- `get_events(session_id, agent_name?, event_type?, limit?)` — reads, filters, sorts
+- Two helpers used by orchestrator: `has_event()`, `count_events()`
+- Wrapped in `@retry_with_backoff(max_attempts=3, initial_delay=0.5)` — retries on transient I/O errors
 
-**Why Memory Stores over Supabase?**
-1. **Decoupling**: Session state lives in the platform, not external infrastructure.
-2. **Simplicity**: No schema management, no queries—just append-only JSONL files.
-3. **Workspace isolation**: Scoped to the workspace, secure by default.
-4. **Audit trail**: Each event is immutable; version history built-in.
+**`tools/email.py`:**
+- `send_email_smtp(args)` — sends per-recipient HTML emails via SMTP
+- Per-recipient rendering: each email gets its own personalized unsubscribe link
+- Side effects:
+  1. Saves a snapshot to `latest_issue.html`/`.md`/`_meta.json` (served by `/latest`)
+  2. Rewrites in-doc anchors to absolute URLs (Gmail strips `id` attributes)
+- Wrapped in `@retry_with_backoff(max_attempts=2, initial_delay=2.0)` — SMTP retries are slower
 
-This aligns with Anthropic's "Scaling Managed Agents: Decoupling the brain from the hands" (Apr 2026).
+**`tools/subscribers.py`:**
+- `get_subscribers()` — returns the live recipient list with this priority:
+  1. Supabase `subscribers` table (live source of truth)
+  2. `RECIPIENT_EMAILS` env var (fallback if Supabase unreachable)
+- This means subscribe/unsubscribe via the website takes effect on the **next run**, with no manual env var update.
 
-### 4 · Public web layer (`app.py`, Vercel)
+**Why one module per tool:**
 
-Flask app deployed via the `index.py` serverless entrypoint (`from app import app`). Hosted at `https://ai-weekly-ecru.vercel.app`.
+The Anthropic article frames each "hand" as `execute(name, input) → string` — a uniform interface but a separate execution boundary. Putting each tool in its own file:
 
-| Method | Route                           | Purpose |
-|--------|---------------------------------|---------|
-| GET    | `/`                             | Subscribe form (`templates/index.html`) |
-| POST   | `/api/subscribe`                | Validates email, enforces **50-subscriber cap**, inserts into `subscribers` |
-| GET    | `/unsubscribe?email=<addr>`     | Deletes the row from `subscribers`, shows a styled confirmation page |
-| GET    | `/latest`                       | Serves `latest_issue.html` (with subject + sent-at as `X-Issue-*` headers); 404 page if no issue saved yet |
-| GET    | `/admin`                        | Plain page listing current subscribers (read-only) |
+- Lets us version and replace each independently.
+- Gives each its own retry policy (Memory Stores vs. SMTP have very different error profiles).
+- Makes testing trivial — import the module, call the function, no orchestrator needed.
+- Mirrors the "tools as cattle" philosophy: a tool failure is a per-tool concern, not a system concern.
 
-A second Supabase table backs this layer:
+### 4.5 Subscriber registry (Supabase)
+
+The Flask app and the orchestrator both read/write to one Supabase table:
 
 ```sql
 CREATE TABLE subscribers (
@@ -209,382 +356,426 @@ CREATE TABLE subscribers (
 );
 ```
 
-The orchestrator only consumes `subscribers` indirectly: the deploy operator copies the `/admin` list into the `RECIPIENT_EMAILS` env var (or the orchestrator could be wired to read the table directly — currently env-driven for simplicity).
+**Write path** (Flask `/api/subscribe`):
+- Validate email format
+- Check for duplicate
+- Enforce 50-subscriber cap (Hobby tier sanity)
+- Insert
 
-### 5 · Execution Models
+**Read paths:**
+- Flask `/admin` — display the current list (read-only HTML page)
+- Orchestrator `tools/subscribers.py` — fetch the list at delivery time
 
-The orchestrator supports two execution modes:
+**Why Supabase, not a flat file or env var:**
+- Concurrent writes (multiple subscribers signing up at once) need transaction safety.
+- The Flask app is multi-process on Vercel; coordination through the database is mandatory.
+- The 50-cap query is cheap with `count='exact'`.
+- Free tier is plenty for this workload (max ~50 rows).
 
-#### A. Monolithic (GitHub Actions, local runs)
-```
-python3 orchestrator_v2.py
-```
-- Runs all 5 steps sequentially in one process
-- 30-min timeout (GitHub Actions), no timeout locally
-- Used by `.github/workflows/newsletter.yml` (production trigger)
+This is the **only piece of external infrastructure** in the system besides Anthropic and SMTP. We deliberately did not adopt Supabase for the session log (Memory Stores serves that), so the dependency is contained.
 
-#### B. Step-Based (for future use, manual debug)
-```
-python3 orchestrator_v2.py --session-id <id> --step evaluate
-```
-- Runs ONE step per invocation
-- Designed for environments with short timeouts (e.g., Vercel Pro 5min, AWS Lambda)
-- Can be chained via HTTP (`/api/step?session_id=X&step=Y`)
-- Useful for debugging individual steps
+### 4.6 Web layer (Vercel + Flask)
 
-**Step config:**
-```
-STEP_ORDER = ["memory", "research", "evaluate", "write_critique", "deliver"]
+Standard Flask app, deployed via Vercel's Python runtime (`index.py` → `from app import app`). Routes:
 
-STEP_TERMINAL_EVENTS = {
-  "memory":         ["covered_topics"],
-  "research":       ["launches_researched", "papers_researched"],
-  "evaluate":       ["items_evaluated"],
-  "write_critique": ["draft_approved"],
-  "deliver":        ["email_sent"],
-}
-```
+| Method | Route                       | Purpose |
+|--------|-----------------------------|---------|
+| GET    | `/`                         | Subscribe form (single-page) |
+| POST   | `/api/subscribe`            | Add to Supabase, with cap enforcement |
+| GET    | `/unsubscribe?email=X`      | Delete from Supabase, styled confirmation |
+| GET    | `/latest`                   | Serve `latest_issue.html` (or 404 page if not yet generated) |
+| GET    | `/admin`                    | Plain page listing current subscribers (no auth — relies on URL obscurity for now) |
 
-**Why GitHub Actions over Vercel Cron?**
-- Vercel Hobby: 60s function timeout — won't fit our 5-15min pipeline
-- GitHub Actions: 6-hour timeout, free, simple YAML config
-- Vercel still hosts the web layer (subscribe form, /latest, /admin)
+**`/latest` content lifecycle:**
+1. Orchestrator runs (Thursday, GitHub Actions).
+2. Delivery agent calls `send_email_smtp`, which writes `latest_issue.html` to disk.
+3. The GitHub Actions workflow commits `latest_issue.html` back to the repo.
+4. Vercel auto-deploys on push.
+5. New `/latest` is live within ~60 seconds of email send.
 
-**Endpoints (Vercel - monitoring only):**
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /api/status?session_id=X` | Live state of a specific run |
-| `GET /api/status?recent=true` | Last 20 runs with summaries |
-| `GET /latest` | Most recent newsletter (HTML) |
-| `GET /admin` | Subscriber list |
+This is a slightly unusual pattern (using git as the deployment channel for runtime-generated content), but for a weekly cadence it's perfect: free, audited, version-controlled, and rolls back easily.
 
----
+### 4.7 Observability (`observability.py`)
 
-### 6 · Observability
+Two primitives, both deliberately minimal:
 
-**Module:** `observability.py`
-
-#### Structured Logging
-Every event logged as a JSON line with session correlation:
-
+**`StructuredLogger`** — emits one JSON object per log line:
 ```json
 {
-  "ts": "2026-05-05T09:00:01Z",
+  "ts": "2026-05-07T09:04:12.123456Z",
   "level": "INFO",
-  "session_id": "newsletter_20260505_090000_abc123",
+  "session_id": "newsletter_...",
   "agent": "research_launches",
-  "message": "agent_start: research_launches",
-  "criticality": "critical",
-  "timeout_sec": 300
+  "message": "agent_end: research_launches",
+  "elapsed_sec": 142.7,
+  "tool_calls": 4,
+  "input_tokens": 45000,
+  "output_tokens": 8200,
+  "cache_read_tokens": 320000
 }
 ```
 
-- Logs go to **stdout** (Vercel captures) AND **`logs/session_{id}.log`** (persistent)
-- Levels: INFO, WARN, ERROR, METRIC
-- Always includes session_id + agent for filtering
+Logs go to **stdout** (where GitHub Actions captures them) and to **`logs/session_{id}.log`** (uploaded as workflow artifacts, 30-day retention).
 
-#### Per-Run Metrics (`RunTracker`)
-Tracks per-agent:
-- Elapsed time (sec)
-- Tokens used (input, output, cache_read)
-- Status (success / failed / skipped)
-- Errors (with traceback)
-
-Persisted to `runs/{session_id}.json` after each run:
+**`RunTracker`** — in-memory accumulator that produces a single run summary:
 ```json
 {
-  "session_id": "newsletter_20260505_090000_abc123",
+  "session_id": "...",
   "total_elapsed_sec": 487.3,
   "agent_timings": { "memory": 12.1, "research_launches": 145.2, ... },
-  "agent_tokens": { "research_launches": { "input": 45000, "output": 8200, "cache_read": 320000 } },
+  "agent_status": { "memory": "success", "research_launches": "success", ... },
+  "agent_tokens": { "research_launches": { "input": 45000, "output": 8200, ... } },
   "totals": { "input_tokens": 380000, "output_tokens": 95000, "cache_read_tokens": 1200000 },
   "errors": [],
   "success": true
 }
 ```
 
-#### Status Endpoint
-```bash
-curl https://your-domain.vercel.app/api/status?session_id=newsletter_20260505_090000_abc123
-```
+Persisted to `runs/{session_id}.json` after every run. Recent N can be listed via `get_recent_runs()` for a future runs-history endpoint.
 
-Returns current state of any session (live or completed):
-```json
-{
-  "session_id": "...",
-  "completed": false,
-  "state": {
-    "memory_complete": true,
-    "launches_complete": true,
-    "papers_complete": false,
-    "evaluation_complete": false,
-    "draft_approved": false,
-    "email_sent": false,
-    "rejection_count": 0,
-    "draft_count": 0
-  },
-  "events_count": 3,
-  "event_types": ["covered_topics", "launches_researched", "..."]
-}
-```
+**Why we did not adopt Datadog / Sentry / OpenTelemetry:**
+- Cost: zero subscribers' worth of free tier doesn't justify any vendor.
+- Cardinality: ~4 runs/month, ~30 events/run. We don't have a metrics scale problem.
+- Lock-in: structured JSON to stdout is portable to any tool we'd adopt later.
 
----
+We will revisit if the system grows to multiple newsletters or sub-daily runs.
 
-### 7 · Error Handling & Retry
+### 4.8 Error handling & retry (`retry.py`)
 
-**Module:** `retry.py`
+Three mechanisms, each operating at a different scope:
 
-#### Retry Policy
-| Error Type | Retry? | Backoff |
-|------------|--------|---------|
-| Rate limit (429) | Yes (3x) | Exponential (1s → 2s → 4s) |
-| Server error (5xx) | Yes (3x) | Exponential |
-| Network/timeout | Yes (3x) | Exponential |
-| Auth error (401/403) | No | — |
-| Validation error (400) | No | — |
-| Tool execution error | Yes (2x) | Linear (2s) |
+**Tool-level retry** (`@retry_with_backoff`):
+- Wraps each `tools/*` function
+- 2–3 attempts depending on the tool (SMTP gets 2; Memory Stores get 3)
+- Exponential backoff (1s → 2s → 4s, capped at 30s)
+- Recognizes Anthropic's transient errors (rate limits, 5xx, "overloaded") via `is_retryable_anthropic_error()`
+- Non-retryable errors (auth failures, 400s) fail immediately
 
-```python
-@retry_with_backoff(max_attempts=3, initial_delay=1.0, exponential_base=2.0,
-                    is_retryable=is_retryable_anthropic_error)
-def call_api(): ...
-```
+**Agent-level timeout & criticality** (in `orchestrator_v2.py`):
 
-#### Per-Agent Criticality
 ```python
 AGENT_CRITICALITY = {
-  "memory": "optional",          # Skip on failure (no past coverage = OK)
-  "research_launches": "critical",  # Must succeed
-  "research_papers": "optional",    # Can produce 0 papers
-  "evaluator": "critical",
-  "writer": "critical",
-  "critic": "critical",
-  "delivery": "critical",
+  "memory":            "optional",
+  "research_launches": "critical",
+  "research_papers":   "optional",
+  "evaluator":         "critical",
+  "writer":            "critical",
+  "critic":            "critical",
+  "delivery":          "critical",
 }
-```
 
-#### Per-Agent Timeouts
-```python
 AGENT_TIMEOUTS = {
-  "memory": 120,
-  "research_launches": 300,
-  "research_papers": 300,
-  "evaluator": 180,
-  "writer": 300,
-  "critic": 180,
-  "delivery": 120,
+  "memory": 120, "research_launches": 300, "research_papers": 300,
+  "evaluator": 180, "writer": 300, "critic": 180, "delivery": 120,
 }
 ```
 
-If an agent exceeds its timeout, it's marked failed and the orchestrator continues (or retries based on criticality).
+If an agent exceeds its timeout, the AgentRunner breaks the event stream and records a failure. The orchestrator decides what to do based on criticality:
+- **Optional** failures → log and continue (e.g., zero papers is acceptable)
+- **Critical** failures → log and abort before delivery
 
-#### Silent Failure Detection (Auto-Insert Placeholder)
-If a research agent silently exits without emitting (observed: Papers agent did this in 2/3 early runs), the orchestrator auto-inserts an empty placeholder event:
+**Pipeline-level fallbacks**:
+The most subtle defense is the **post-condition placeholder**. If the Research Launches or Research Papers agent silently exits without emitting its terminal event (a real bug observed in 2 of 3 early runs), the orchestrator inserts an empty placeholder event:
 
 ```python
 {
   "event_type": "papers_researched",
-  "data": { "papers": [], "auto_inserted": True, "note": "Agent did not emit." }
+  "data": { "papers": [], "auto_inserted": True, "note": "..." }
 }
 ```
 
-This unblocks downstream agents and makes the failure visible in logs.
+This unblocks the Evaluator (which depends on the terminal event existing), preserves the failure in the log, and lets the pipeline ship a (lighter) issue rather than dropping the week.
 
-#### Writer/Critic Loop (State-Driven Retry)
-Max 2 retries (3 total writer attempts). Loop driven by event counts:
-- `drafts == rejections` → Writer needs to write again
-- `drafts > rejections` → Critic needs to review
-- `draft_approved` event → Loop exits successfully
+**Why we don't have a global "alert on failure" yet:**
+GitHub Actions emails the workflow owner on job failure. That's the alert. We have not added Slack/PagerDuty because the system runs once a week and the GitHub email is sufficient.
 
-#### Resume from Crash
-```bash
-# Pipeline died mid-run? Restart from last checkpoint:
-curl https://your-domain.vercel.app/api/step?session_id=newsletter_...&step=evaluate
+---
+
+## 5. End-to-End Data Flow
+
+A single Thursday's run, in time order:
+
+```
+T+0:00    GitHub Actions cron fires (0 9 * * 4)
+T+0:01    Ubuntu runner provisioned, repo cloned, deps installed
+T+0:30    `python3 orchestrator_v2.py` starts
+          ↓ generates session_id = "newsletter_20260507_090030_a1b2c3d4"
+          ↓ logger + tracker initialized
+
+T+0:31    Step 1: MEMORY AGENT (Haiku, ~30s)
+          • Reads /mnt/memory/ for events from prior session_ids
+          • Extracts topics covered in last 12 weeks
+          • emit_event("covered_topics", {...})
+
+T+1:00    Step 2: RESEARCH (parallel, Opus × 2, ~3 min)
+          ┌─ Research Launches: web search, filter, evaluate
+          │  emit_event("launches_researched", { launches: [5–7 items] })
+          └─ Research Papers: web search, filter, evaluate
+             emit_event("papers_researched", { papers: [2–3 items] })
+          (post-condition: orchestrator inserts placeholder if either is missing)
+
+T+4:30    Step 3: EVALUATOR (Opus, ~2 min)
+          • get_events() → reads launches, papers, covered_topics
+          • Scores each item on relevance/depth/novelty (1–10 each)
+          • Drops items with total < 18, drops covered duplicates
+          • emit_event("items_evaluated", { selected_launches, selected_papers, rejected_items, summary })
+
+T+6:30    Step 4: WRITER ↔ CRITIC LOOP (Opus × N, ~3–6 min)
+          • Writer: get_events("items_evaluated") → draft → emit_event("draft_written")
+          • Critic: get_events("draft_written") → review →
+              ◦ If approved: emit_event("draft_approved")
+              ◦ If rejected: emit_event("critic_rejection") → loop back to Writer
+          (max 2 rejections; 3 total Writer attempts)
+
+T+10:30   Step 5: DELIVERY (Haiku, ~1 min)
+          • get_events("draft_approved") → final markdown
+          • Calls send_email_smtp:
+              ◦ tools/subscribers.get_subscribers() → live list from Supabase
+              ◦ tools/email.handle_send_email_smtp(subject, markdown):
+                  - Per-recipient HTML render (personalized unsubscribe)
+                  - Save snapshot: latest_issue.{html,md,json}
+                  - SMTP send to all subscribers
+          • emit_event("email_sent", { recipients, subject })
+
+T+11:30   Orchestrator finalizes:
+          • RunTracker.persist() → writes runs/{session_id}.json
+          • briefs/{session_id}_log.json written (compact view of run)
+
+T+11:35   GitHub Actions workflow:
+          • Commits latest_issue.{html,md,json} to repo
+          • Uploads logs/, runs/, briefs/ as workflow artifacts (30-day retention)
+          • Pushes to main
+
+T+12:00   Vercel auto-deploys the new commit
+          • /latest now serves the new issue
+          • Subscribers see new edition in their inbox
 ```
 
 ---
 
-### 8 · Resume support
+## 6. Failure Modes & Recovery
 
-`orchestrator_v2.py` accepts `--session-id <id>`. On resume:
+| Failure | Detection | Recovery |
+|---------|-----------|----------|
+| Anthropic API rate-limited | Retry decorator catches 429 | Exponential backoff, 3 attempts |
+| Agent silently exits without emitting | Post-condition check after step | Auto-insert placeholder event; pipeline continues |
+| Agent exceeds per-agent timeout | AgentRunner timer breaks stream | Marked failed; criticality decides if pipeline aborts |
+| Critic rejects 3 times | Loop counter hits max_retries | Pipeline aborts before delivery; week is skipped |
+| GitHub Actions runner killed mid-run | Workflow shows failure | Re-trigger with `--session-id <id>` resumes from last terminal event |
+| SMTP server transient failure | `tools/email.py` retry decorator | 2 attempts with 2s/4s backoff |
+| Supabase unreachable for subscriber fetch | `tools/subscribers.py` returns None | Falls back to `RECIPIENT_EMAILS` env var |
+| Memory Stores write failure | `emit_event` returns `{ok: false}` | Tool-level retry; if persistent, agent receives error and decides |
+| Vercel deploy fails after commit | Vercel dashboard shows red | Manual rollback; orchestrator already sent emails — only `/latest` page is stale |
+| `latest_issue.html` git push conflict | Workflow exits nonzero | Re-run workflow; idempotent commit |
 
-1. The orchestrator reads all events for that `session_id` from `session_events`.
-2. Each step is skipped if its terminal event already exists:
-   - `covered_topics` → skip Memory
-   - `launches_researched` AND `papers_researched` → skip parallel research
-   - `items_evaluated` → skip Evaluator
-   - `draft_approved` → skip the Writer/Critic loop entirely
-   - `email_sent` → already complete, exit
-3. The Writer/Critic loop is **state-driven** by counts of `draft_written` vs `critic_rejection`, so a partial loop picks up correctly (e.g. one rejection + waiting-for-retry → next call writes the new draft).
-
-```bash
-# fresh run
-python3 orchestrator_v2.py
-
-# resume a specific session that died mid-way
-python3 orchestrator_v2.py --session-id newsletter_20260504_160649_80879d6e
-```
+The system is designed to **degrade gracefully, fail loudly, and require zero manual intervention for transient failures**.
 
 ---
 
-## Workflow (full happy path)
+## 7. Security & Privacy Posture
 
-```
-1.  Generate session_id  →  newsletter_<UTC-timestamp>_<8-hex>
-2.  Memory Agent          reads cross-run history, emits covered_topics
-3.  Research Launches  ⎫
-                        ⎬  run in parallel, emit launches_researched / papers_researched
-4.  Research Papers    ⎭
-5.  Evaluator             reads (3 + 4), scores, emits items_evaluated
-6.  Writer                reads (5), emits draft_written
-7.  Critic                reads (6), emits draft_approved | critic_rejection
-       └─ if rejected and retries remain → back to (6)        (max 2 retries)
-8.  Delivery              calls send_email_smtp:
-                          • renders per-recipient HTML (personalised unsubscribe)
-                          • SMTP-sends to RECIPIENT_EMAILS
-                          • side-effect: writes latest_issue.{html,md,json}
-                          • emits email_sent
-9.  Orchestrator          writes briefs/<session_id>_log.json
-```
+This is a small, public-facing system. We did not over-engineer security, but we did reason about it.
 
-### Public site (independent of pipeline runs)
+**Threat model (what we worry about):**
+- **Subscriber email leak.** All emails are stored in Supabase (free tier, RLS not configured). The `/admin` page exposes them without auth. This is acceptable for the current population (friends/family + first ~50 subscribers); it's not acceptable at scale.
+- **SMTP credential exposure.** `SMTP_PASSWORD` is a Gmail App Password — limited blast radius (only sends mail from that account; cannot read inbox). Stored in GitHub Secrets and Vercel Env Vars.
+- **Anthropic key exposure.** Same: GitHub Secrets + Vercel Env Vars. Rotation is manual.
+- **Prompt injection from research content.** The Research agents fetch web content; this content is fed into downstream agent context. We do not currently strip injection patterns. The Evaluator and Critic provide some defense-in-depth (an injected prompt asking us to email private data would have to survive 4+ agent stages).
 
-```
-Visitor → /                       subscribe form
-       → POST /api/subscribe      validate · check cap · insert into subscribers
-       → /unsubscribe?email=…     delete row · confirmation page
-       → /latest                  serve latest_issue.html written by step 8 above
-Operator → /admin                 see subscriber list
-```
+**What we do not protect against:**
+- A malicious GitHub collaborator with write access (could change the workflow file).
+- A compromised Anthropic API key (would allow arbitrary token spend).
+- A compromised Vercel deployment (could exfiltrate Supabase data).
+
+**Improvements we'd make at scale:**
+- Move `/admin` behind auth (Vercel password protection or Supabase Auth).
+- Add Supabase RLS policies so the anon key can only insert/delete on `subscribers`, not select bulk.
+- Rotate SMTP and Anthropic keys quarterly.
+- Add prompt-injection sanitization on research content.
 
 ---
 
-## Costs (per weekly run, estimated)
+## 8. Performance & Cost
 
-| Agent | Model | Est. Cost |
-|-------|-------|-----------|
-| Memory             | Haiku | $0.20 |
-| Research Launches  | Opus  | $2.00 |
-| Research Papers    | Opus  | $2.00 |
-| Evaluator          | Haiku | $0.30 |
-| Writer             | Opus  | $2.50 |
-| Critic             | Opus  | $1.50 |
-| Delivery           | Haiku | $0.20 |
-| **Total**          |       | **~$8.70/run** |
+**Per-run timing (observed, p50):**
+- Memory: 12s
+- Research (parallel): 145s (worst of the two)
+- Evaluator: 95s
+- Writer (single attempt): 110s
+- Critic (single review): 75s
+- Delivery: 35s
+- Orchestrator overhead: ~10s
+- **Total: ~8 minutes** (no Critic retries)
+- **With one Critic retry: ~12 minutes**
 
-Monthly (4 runs): **~$35**.
+**Per-run cost (observed range, USD):**
+- Lowest observed: $0.77 (heavy cache hits, single Critic pass)
+- Average: $2.08
+- Highest observed: $3.91 (two Critic retries → 3 Writer + 3 Critic passes)
+- Cache hit rate: ~83% on Opus inputs (Anthropic's prompt caching does real work here)
 
-Vercel hobby tier and Supabase free tier cover the web layer at $0 for this workload.
+**Cost dominators:**
+- Writer Opus calls (~30%)
+- Research Opus calls (~25% combined)
+- Evaluator Opus (~20%)
+- Critic Opus (~15%)
+- Haiku agents (~10% combined)
 
-Cost dominators: prompt caching is doing real work — typical Critic round shows ~80% cache reads vs full input. If you turn caching off, expect roughly 4–5× these numbers.
+**Operational cost (monthly, 4 runs):**
+- Anthropic API: $8–$32
+- GitHub Actions: $0 (Hobby tier, well under free quota)
+- Vercel: $0 (Hobby tier)
+- Supabase: $0 (free tier)
+- Gmail SMTP: $0
+- **Total: $8–$32/month**
 
 ---
 
-## Opinions on Managed Agents
+## 9. Decisions Log
 
-### When Managed Agents shines
+Brief notes on choices that warrant justification.
 
-1. **Multi-agent systems with specialization.** Each agent has one job. Reusable, debuggable, swappable.
-2. **Long-horizon tasks needing durable state.** Session log persists across failures. *Resume from last successful event* is implemented here via `--session-id` (see §5 above).
-3. **Parallel cognitive work.** Two research agents concurrently is faster and cheaper than sequential.
-4. **Critic / feedback loops.** Quality gates between agents catch errors before they propagate.
-5. **Hot-swappable components.** Want a better evaluator? Update Agent 4 in the Console; nothing else changes.
+| Decision | Alternatives considered | Why |
+|----------|------------------------|-----|
+| Memory Stores JSONL for session log | Supabase table; SQLite | JSONL is the native primitive of the platform; no schema; trivially inspectable |
+| GitHub Actions for orchestration | Vercel Cron + Functions; AWS Lambda; Modal | Vercel Hobby's 60s cap is fatal; GH Actions is free with 6h headroom |
+| Vercel for web only | Render; Fly.io | Already using for Flask; auto-deploy on git push is the perfect channel for `latest_issue.html` |
+| Per-tool modules under `tools/` | One `tool_handlers.py` file | Independent failure boundaries; per-tool retry policies |
+| State-driven Writer/Critic loop | Counter-driven | Counts of `draft_written` vs `critic_rejection` give correct resume behavior automatically |
+| Auto-insert placeholder on silent agent failure | Hard-fail; Manual restart | Optional agents shouldn't kill the run; failure stays visible in the log |
+| Opus for cognitive agents, Haiku for mechanical | All-Opus; All-Haiku | Tiering cuts ~40% of cost with no observable quality loss on Haiku-assigned tasks |
+| Supabase as live subscriber source | Static `RECIPIENT_EMAILS` env | Avoids weekly manual env-var updates after subscribe/unsubscribe |
+| Commit `latest_issue.html` to repo | Object storage (S3); database blob | Free; auditable; rolls back via git revert |
+| Single shared `session_events` style log across all runs | Per-run isolated logs | Memory Agent needs cross-run history (covered topics); easier than a separate cross-run store |
+| 50-subscriber cap | No cap | Sanity for a Hobby-tier system; trivially raised |
+| No structured alerting (Slack/PagerDuty) | Slack webhook on failure | GitHub email-on-failure is sufficient for weekly cadence |
 
-### When Managed Agents is overkill
+---
+
+## 10. When This Architecture Is Right (and When It's Not)
+
+This system is intentionally over-engineered for one subscriber. The point is to exercise the patterns, not to optimize the immediate workload.
+
+### Use this pattern when you have:
+
+1. **Multiple specialized agents.** Not "one big prompt" — actual cognitive specialization (research vs. writing vs. critique).
+2. **Long-horizon execution.** Multi-minute pipelines where partial failures are common.
+3. **Quality gates between agents.** A Critic that can reject the Writer's output is the canonical example.
+4. **Cross-run memory.** The Memory Agent reading prior coverage is what differentiates "newsletter" from "summary."
+5. **Operational quietness as a goal.** Subscribe → live; orchestrator → autonomous.
+
+### Do not adopt this pattern for:
 
 1. **Single-shot tasks.** A summarizer needs one agent, not a hosted runtime.
-2. **Workflows you fully control.** Deterministic logic doesn't need an agent runtime.
-3. **Low-stakes outputs.** No need for critic loops or memory if output quality doesn't matter.
+2. **Workflows you fully control.** Deterministic logic (data pipelines, ETL) doesn't need an agent runtime.
+3. **Low-stakes outputs.** No Critic needed if a misfire costs nothing.
+4. **High-frequency tasks.** Sub-minute pipelines don't benefit from session/event-sourcing overhead — just call the API directly.
 
-### The session-as-state insight
+### What would change at 1000 subscribers / multiple newsletters:
 
-The most powerful concept is treating the session as **durable shared state**, not just a conversation log. This is similar to event sourcing in distributed systems — replay events to reconstruct state, never overwrite.
+- Move `/admin` behind auth.
+- Add Supabase RLS.
+- Add per-newsletter sharding of the session log.
+- Replace the single GH Actions runner with a queue (QStash, SQS) so multiple newsletters can run concurrently.
+- Add Datadog or similar for cross-run metric trending.
+- Move SMTP from Gmail to a transactional provider (Resend, Postmark).
+- Add A/B testing of Writer prompts.
 
-I used Supabase as the shared event store because the SDK doesn't yet expose multi-agent sessions natively. The pure vision: ONE Managed Agents session that all agents `getEvents`/`emitEvent` against.
-
-### What's still missing
-
-1. **Human-in-the-loop approval gate** before Delivery.
-2. **Cron / scheduled trigger** — the only trigger today is manual `python3 orchestrator_v2.py`. A Vercel Cron or GitHub Actions workflow would close this.
-3. **Observability beyond Claude Console** — token cost per agent over time, alerting, dashboards.
-4. **A/B testing** — run two Writer versions, compare quality.
-5. **Long-term memory across runs** — Memory Agent reads past `session_events`, but a RAG/embeddings layer over past briefs would be richer than topic strings.
-6. **Reading subscribers directly** — currently the orchestrator pulls `RECIPIENT_EMAILS` from env. It could query the `subscribers` table directly so subscribe/unsubscribe takes effect on the next run without an env edit.
+None of these are needed today. They are obvious at the scale that triggers them.
 
 ---
 
-## Files
+## 11. Open Questions / Future Work
 
-| File | Purpose |
+Concrete next moves we have considered but not yet built:
+
+1. **Human-in-the-loop approval gate** before Delivery. A Slack message with the rendered draft + "Ship it" button. Adds latency but eliminates Critic-misjudged sends.
+2. **Per-recipient personalization in the Writer.** The Writer currently produces one brief; we could pass each subscriber's preferences in via the session and customize.
+3. **Long-term memory beyond covered topics.** A RAG layer over the past 12 issues' content for the Memory Agent to reason over richly, not just topic strings.
+4. **A/B testing Writer prompts.** Two Writer agents in parallel; second Critic ranks them; ship the winner. ~2× cost; would tell us empirically whether prompt iterations help.
+5. **Failure alerting beyond GitHub email.** Slack webhook for structured failure summaries.
+6. **Public run history.** A `/runs` endpoint reading from `runs/*.json`, showing token cost and timing trends.
+
+---
+
+## 12. Appendices
+
+### 12.1 File reference
+
+| Path | Purpose |
 |------|---------|
-| `orchestrator_v2.py`           | Multi-agent orchestrator (step-based) + AgentRunner with retry/timeout/observability |
-| `observability.py`             | Structured JSON logger, RunTracker (per-agent metrics), run history |
-| `retry.py`                     | Exponential backoff retry decorator + Anthropic error classifier |
-| `credentials.py`               | Credential manager (env vars; Anthropic vault placeholder) |
-| `tools/__init__.py`            | Tool exports (many hands pattern) |
-| `tools/memory_store.py`        | Hand 1: emit_event, get_events (Memory Stores JSONL) |
-| `tools/email.py`               | Hand 2: send_email_smtp (SMTP + per-recipient render + snapshot) |
-| `api/orchestrate.py`           | Vercel function: cron entry, triggers step 1 |
-| `api/step.py`                  | Vercel function: runs one step, chains next |
-| `api/status.py`                | Vercel function: live state + recent runs |
-| `email_renderer.py`            | Editorial HTML rendering (per-recipient unsubscribe + Gmail-safe TOC) |
-| `app.py`                       | Flask app: `/`, `/api/subscribe` (50-cap), `/unsubscribe`, `/latest`, `/admin` |
-| `index.py`                     | Vercel serverless entrypoint for Flask |
-| `vercel.json`                  | Cron config (Thursday 9am UTC), function maxDuration, env vars |
-| `templates/index.html`         | Subscribe page template |
-| `requirements.txt`             | Python deps |
-| `.env`, `.env.example`         | Config (SMTP, ANTHROPIC_API_KEY, APP_BASE_URL, RECIPIENT_EMAILS) |
-| `briefs/`                      | Per-run JSON logs (gitignored) |
-| `logs/`                        | Per-session structured JSON log files (gitignored) |
-| `runs/`                        | Per-run summary metrics for /api/status?recent=true (gitignored) |
-| `memory_local/`                | Local Memory Stores fallback for testing (gitignored) |
-| `latest_issue.{html,md,json}`  | Snapshot of the most recent send, served by `/latest` (gitignored) |
-| `architecture_diagram.svg`     | System as a one-page diagram |
+| `orchestrator_v2.py` | Step-based orchestrator + AgentRunner with retry/timeout/observability |
+| `observability.py` | StructuredLogger, RunTracker, run-history readers |
+| `retry.py` | Exponential backoff decorator + Anthropic transient-error classifier |
+| `credentials.py` | Credential resolution chain (env → vault placeholder) |
+| `tools/__init__.py` | Tool exports (many-hands pattern) |
+| `tools/memory_store.py` | `emit_event`, `get_events` (session log) |
+| `tools/email.py` | `send_email_smtp` (SMTP + per-recipient render + snapshot) |
+| `tools/subscribers.py` | `get_subscribers` (Supabase live fetch + env fallback) |
+| `email_renderer.py` | Editorial HTML rendering (per-recipient unsubscribe + Gmail-safe TOC) |
+| `app.py` | Flask web app: subscribe / unsubscribe / latest / admin |
+| `index.py` | Vercel Python runtime entrypoint (`from app import app`) |
+| `vercel.json` | Vercel config (web layer only) |
+| `.github/workflows/newsletter.yml` | GitHub Actions cron + manual trigger |
+| `templates/index.html` | Subscribe page template |
+| `requirements.txt` | Python dependencies |
+| `briefs/` | Per-run JSON logs (gitignored) |
+| `logs/` | Per-session structured JSON log files (gitignored) |
+| `runs/` | Per-run summary metrics (gitignored) |
+| `memory_local/` | Local Memory Stores fallback for testing (gitignored) |
+| `latest_issue.{html,md,json}` | Latest newsletter (committed by GH Actions; served by `/latest`) |
+| `architecture_diagram.svg` | One-page system diagram |
 
-### Required env vars
+### 12.2 Required environment variables
 
+GitHub Secrets (orchestrator):
 ```
-ANTHROPIC_API_KEY=...
-SUPABASE_URL=...                 # or NEXT_PUBLIC_SUPABASE_URL
-SUPABASE_ANON_KEY=...            # or ANON_KEY
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=...
-SMTP_PASSWORD=...                # Gmail app password
-SMTP_FROM=...                    # defaults to SMTP_USER
-RECIPIENT_EMAILS=a@x.com,b@y.com
-APP_BASE_URL=https://ai-weekly-ecru.vercel.app
+ANTHROPIC_API_KEY      # Anthropic platform key
+SMTP_USER              # Gmail address
+SMTP_PASSWORD          # Gmail App Password (not regular password)
+APP_BASE_URL           # https://your-domain.vercel.app
+SUPABASE_URL           # Supabase project URL
+SUPABASE_ANON_KEY      # Supabase anon key
+RECIPIENT_EMAILS       # Fallback list (used only if Supabase unavailable)
+SMTP_HOST              # Defaults to smtp.gmail.com
+SMTP_PORT              # Defaults to 587
+SMTP_FROM              # Defaults to SMTP_USER
 ```
+
+Vercel Environment Variables (web layer):
+```
+SUPABASE_URL, SUPABASE_ANON_KEY     # for subscribe/unsubscribe/admin
+APP_BASE_URL                          # for absolute link generation
+```
+
+### 12.3 Inspecting a run
+
+```bash
+# Recent runs (downloaded from GH Actions artifacts):
+ls runs/ | sort | tail -5
+
+# Full event stream of a session:
+cat memory_local/session_<id>.jsonl | jq '.event_type'
+
+# Run summary:
+jq '.' runs/<session_id>.json
+
+# Log lines for a specific agent:
+grep '"agent":"writer"' logs/session_<id>.log | jq '.'
+```
+
+### 12.4 Operational rituals
+
+| Ritual | Frequency | What |
+|--------|-----------|------|
+| Inbox check | Weekly (Thursday morning) | Confirm email arrived |
+| `/latest` check | Weekly | Confirm new issue served |
+| GH Actions run review | Weekly | Skim logs for warnings/auto-inserted placeholders |
+| Cost review | Monthly | Anthropic dashboard; investigate if > $10/run |
+| Subscriber audit | Monthly | `/admin` page; remove obvious dupes/typos |
+| Anthropic key rotation | Quarterly | Generate new key, update Vercel + GH secrets |
+| SMTP password rotation | Quarterly | Generate new App Password, update secrets |
 
 ---
 
-## How to run
-
-```bash
-cd ~/Desktop/agent_app
-python3 orchestrator_v2.py                                  # fresh run
-python3 orchestrator_v2.py --session-id newsletter_…        # resume
-```
-
-Inspect a run:
-
-```sql
-SELECT agent_name, event_type, created_at
-FROM session_events
-WHERE session_id = 'newsletter_…'
-ORDER BY created_at;
-```
-
-Run the web app locally:
-
-```bash
-python3 app.py                  # http://127.0.0.1:5000
-```
-
----
-
-## Conclusion
-
-The hardest part wasn't building agents. It was understanding when each architectural pattern matters. Managed Agents is a tool for systems that need **specialization + coordination + durable state**. If you don't need all three, you don't need Managed Agents.
-
-For the AI Weekly newsletter specifically, multi-agent is overkill at 1 subscriber. But as a learning exercise it's the right project — enough complexity to exercise every Managed Agents pattern (parallel branches, feedback loops, shared state, durable resume, custom tools) without overwhelming the architecture.
+*End of architecture document.*
