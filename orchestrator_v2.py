@@ -1,35 +1,45 @@
 #!/usr/bin/env python3
 """
-Multi-Agent Newsletter Orchestrator v2 - Shared Session Pattern.
+Multi-Agent Newsletter Orchestrator v3 - Step-Based Architecture.
 
-True "many brains, one session" pattern with Anthropic Memory Stores:
-- All 7 agents read/write to a SHARED session log (Anthropic Memory Stores at /mnt/memory/)
-- Each agent emits its work as events (JSONL format)
-- Subsequent agents read prior events via get_events()
-- Orchestrator handles custom tools: emit_event, get_events, send_email_smtp
-- Credentials (SMTP password) stored in Anthropic credential vault
+Aligns with Anthropic's "Scaling Managed Agents: Decoupling the brain from the hands":
+- Each step is independent and stateless (cattle, not pets)
+- Session log = durable shared state (Memory Stores JSONL)
+- Each "hand" (tool) is its own module, can fail/retry independently
+- Steps can run in separate Vercel functions (avoids timeout)
+- Full observability: structured JSON logs + per-agent metrics
+- Retry with exponential backoff on transient failures
+- Resume from any step via session_id
 
-Inspired by "Scaling Managed Agents: Decoupling the brain from the hands" (Anthropic, Apr 2026)
+Architecture:
+- Brain = Managed Agents (7 specialized agents)
+- Hands = tools/ modules (memory_store, email)
+- Session = JSONL files in /mnt/memory/ or ./memory_local/
+- Harness = this file (or split api/ functions for Vercel)
 """
+
 import argparse
 import json
 import os
-import smtplib
-import ssl
 import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import anthropic
 from dotenv import load_dotenv
-from email_renderer import render_brief_email_html
-from credentials import get_credential_manager
+
+from observability import StructuredLogger, RunTracker
+from retry import retry_call, is_retryable_anthropic_error
+from tools.memory_store import (
+    handle_emit_event,
+    handle_get_events,
+    has_event,
+    count_events,
+)
+from tools.email import handle_send_email_smtp
 
 load_dotenv(override=True)
 
@@ -48,246 +58,96 @@ AGENTS = {
     "delivery": "agent_011CahyfZR9qeUvsHuMFS2Co",
 }
 
-# ============================================================================
-# MEMORY STORES (Shared Session Log - Anthropic Managed Agents)
-# ============================================================================
-# Agents write to /mnt/memory/session_{session_id}.jsonl (workspace-scoped, persistent)
-# This replaces the prior Supabase session_events table.
-# Note: Orchestrator running locally can read the JSONL files if they're copied locally,
-# or rely on agents returning event data via tool results.
-MEMORY_DIR = Path("/mnt/memory")
-LOCAL_MEMORY_DIR = Path(os.getenv("LOCAL_MEMORY_DIR", "./memory_local"))  # Local fallback for testing
+# Steps in order. Each step has terminal event(s) that mark completion.
+# Used by step-based orchestration (one Vercel function per step).
+STEP_ORDER = ["memory", "research", "evaluate", "write_critique", "deliver"]
 
+STEP_TERMINAL_EVENTS = {
+    "memory": ["covered_topics"],
+    "research": ["launches_researched", "papers_researched"],
+    "evaluate": ["items_evaluated"],
+    "write_critique": ["draft_approved"],
+    "deliver": ["email_sent"],
+}
 
-# ============================================================================
-# CUSTOM TOOL HANDLERS
-# ============================================================================
-def handle_emit_event(session_id: str, agent_name: str, event_type: str, data: dict) -> Dict[str, Any]:
-    """
-    Emit an event to the shared session log (Memory Stores JSONL).
-    Agents write directly to /mnt/memory/session_{session_id}.jsonl.
-    This handler confirms receipt and assigns an event_id.
+# Critical agents must succeed; optional ones can be skipped on failure.
+AGENT_CRITICALITY = {
+    "memory": "optional",
+    "research_launches": "critical",
+    "research_papers": "optional",  # Can produce 0 papers
+    "evaluator": "critical",
+    "writer": "critical",
+    "critic": "critical",
+    "delivery": "critical",
+}
 
-    In a production setup where the orchestrator runs as a Managed Agent itself,
-    the agent would write directly. For now, we support both:
-    - Agents write via bash: echo '{"event": ...}' >> /mnt/memory/session_{id}.jsonl
-    - Orchestrator writes on behalf: append to local memory JSONL file
-    """
-    try:
-        event_id = str(uuid.uuid4())
-        event = {
-            "id": event_id,
-            "session_id": session_id,
-            "agent_name": agent_name,
-            "event_type": event_type,
-            "data": data,
-            "created_at": datetime.utcnow().isoformat() + "Z",
-        }
-
-        # Try to write to /mnt/memory/ if it exists (running in Managed Agents environment)
-        # Otherwise, write to local directory for testing
-        try:
-            memory_file = MEMORY_DIR / f"session_{session_id}.jsonl"
-            if MEMORY_DIR.exists():
-                memory_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(memory_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(event) + "\n")
-                return {"ok": True, "event_id": event_id}
-        except (OSError, PermissionError):
-            pass
-
-        # Fallback: write to local memory directory
-        LOCAL_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-        local_file = LOCAL_MEMORY_DIR / f"session_{session_id}.jsonl"
-        with open(local_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event) + "\n")
-        return {"ok": True, "event_id": event_id}
-
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-def handle_get_events(session_id: str, agent_name: Optional[str] = None,
-                       event_type: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Read events from the shared session log (Memory Stores JSONL).
-    Agents write directly to /mnt/memory/session_{session_id}.jsonl.
-    This handler reads and filters the JSONL file.
-
-    Args:
-        session_id: Required - filter to specific session
-        agent_name: Optional - filter by agent name
-        event_type: Optional - filter by event type
-
-    Returns: {"ok": True, "events": [sorted by created_at]} or error dict
-    """
-    try:
-        events = []
-
-        # Try to read from /mnt/memory/ if it exists (Managed Agents environment)
-        # Otherwise, read from local directory
-        memory_file = None
-        if MEMORY_DIR.exists():
-            memory_file = MEMORY_DIR / f"session_{session_id}.jsonl"
-        if memory_file is None or not memory_file.exists():
-            memory_file = LOCAL_MEMORY_DIR / f"session_{session_id}.jsonl"
-
-        if not memory_file.exists():
-            return {"ok": True, "events": []}
-
-        # Read JSONL file and filter
-        with open(memory_file, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    event = json.loads(line)
-                    # Apply filters
-                    if event.get("session_id") != session_id:
-                        continue
-                    if agent_name and event.get("agent_name") != agent_name:
-                        continue
-                    if event_type and event.get("event_type") != event_type:
-                        continue
-                    events.append(event)
-                except json.JSONDecodeError:
-                    # Skip malformed lines
-                    continue
-
-        # Sort by created_at (JSONL order is append-only, should already be sorted)
-        events.sort(key=lambda e: e.get("created_at", ""))
-        return {"ok": True, "events": events}
-
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-def _save_latest_issue(subject: str, body_markdown: str, body_html_public: str) -> None:
-    """Persist the latest issue so /latest can serve it on the website."""
-    try:
-        out_dir = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(out_dir, "latest_issue.html"), "w", encoding="utf-8") as f:
-            f.write(body_html_public)
-        with open(os.path.join(out_dir, "latest_issue.md"), "w", encoding="utf-8") as f:
-            f.write(body_markdown)
-        with open(os.path.join(out_dir, "latest_issue_meta.json"), "w", encoding="utf-8") as f:
-            json.dump({
-                "subject": subject,
-                "sent_at": datetime.utcnow().isoformat() + "Z",
-            }, f, indent=2)
-        print(f"[issue] Saved latest issue: {subject}", flush=True)
-    except Exception as e:
-        print(f"[issue] Failed to save latest issue: {e}", flush=True)
-
-
-def handle_send_email_smtp(args: dict) -> Dict[str, Any]:
-    """
-    Send email via SMTP with credentials from Anthropic credential vault or env.
-    Renders per-recipient HTML and saves snapshot for /latest endpoint.
-    """
-    # Retrieve credentials with fallback chain (vault → env vars → defaults)
-    cred_mgr = get_credential_manager()
-    try:
-        creds = cred_mgr.get_smtp_credentials()
-        host = creds["host"]
-        port = int(creds["port"])
-        user = creds["user"]
-        password = creds["password"]
-        from_addr = creds.get("from_addr") or user
-    except (ValueError, TypeError) as e:
-        return {"ok": False, "error": f"SMTP credential error: {e}"}
-
-    recipients_env = os.environ.get("RECIPIENT_EMAILS", "")
-    base_url = os.environ.get("APP_BASE_URL", "http://localhost:5000")
-
-    if not user or not password:
-        return {"ok": False, "error": "SMTP_USER or SMTP_PASSWORD not set"}
-
-    recipients = args.get("recipients") or [
-        r.strip() for r in recipients_env.split(",") if r.strip()
-    ]
-    if not recipients:
-        return {"ok": False, "error": "No recipients"}
-
-    subject = args["subject"]
-    body_markdown = args["body_markdown"]
-
-    # Save a non-personalised copy for /latest on the public site.
-    public_html = render_brief_email_html(body_markdown)
-    _save_latest_issue(subject, body_markdown, public_html)
-
-    print(f"[SMTP] Sending to recipients: {recipients}", flush=True)
-    sent: List[str] = []
-    failures: List[Dict[str, str]] = []
-
-    try:
-        with smtplib.SMTP(host, port, timeout=30) as server:
-            server.ehlo()
-            server.starttls(context=ssl.create_default_context())
-            server.ehlo()
-            server.login(user, password)
-            for recipient in recipients:
-                try:
-                    body_html = render_brief_email_html(
-                        body_markdown,
-                        recipient_email=recipient,
-                        base_url=base_url,
-                    )
-                    msg = MIMEMultipart("alternative")
-                    msg["Subject"] = subject
-                    msg["From"] = from_addr
-                    msg["To"] = recipient
-                    msg.attach(MIMEText(body_markdown, "plain", "utf-8"))
-                    msg.attach(MIMEText(body_html, "html", "utf-8"))
-                    server.sendmail(from_addr, [recipient], msg.as_string())
-                    sent.append(recipient)
-                except Exception as e:
-                    failures.append({"recipient": recipient, "error": f"{type(e).__name__}: {e}"})
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-    print(f"[SMTP] Sent successfully to: {sent}", flush=True)
-    if failures:
-        print(f"[SMTP] Failed for: {failures}", flush=True)
-
-    return {
-        "ok": len(sent) > 0,
-        "recipients": sent,
-        "failures": failures,
-        "subject": subject,
-    }
+# Per-agent timeouts (seconds). If an agent exceeds, we mark as failed.
+AGENT_TIMEOUTS = {
+    "memory": 120,
+    "research_launches": 300,
+    "research_papers": 300,
+    "evaluator": 180,
+    "writer": 300,
+    "critic": 180,
+    "delivery": 120,
+}
 
 
 # ============================================================================
 # AGENT RUNNER
 # ============================================================================
 class AgentRunner:
-    def __init__(self, client: anthropic.Anthropic, shared_session_id: str):
+    """Runs a single agent with retry, timeout, and observability."""
+
+    def __init__(self, client: anthropic.Anthropic, shared_session_id: str,
+                 logger: Optional[StructuredLogger] = None,
+                 tracker: Optional[RunTracker] = None):
         self.client = client
         self.shared_session_id = shared_session_id
+        self.logger = logger or StructuredLogger(session_id=shared_session_id)
+        self.tracker = tracker
 
     def handle_tool_call(self, event, session_id: str, agent_name: str):
-        """Route custom tool calls to handlers."""
+        """Route custom tool calls to handlers (independent hands)."""
         tool_name = getattr(event, "tool_name", None) or getattr(event, "name", None)
         tool_input = event.input or {}
 
-        if tool_name == "emit_event":
-            result = handle_emit_event(
-                session_id=tool_input.get("session_id", self.shared_session_id),
-                agent_name=agent_name,
-                event_type=tool_input.get("event_type", ""),
-                data=tool_input.get("data", {}),
+        self.logger.info(
+            f"tool_call: {tool_name}",
+            agent=agent_name,
+            tool=tool_name,
+        )
+
+        try:
+            if tool_name == "emit_event":
+                result = handle_emit_event(
+                    session_id=tool_input.get("session_id", self.shared_session_id),
+                    agent_name=agent_name,
+                    event_type=tool_input.get("event_type", ""),
+                    data=tool_input.get("data", {}),
+                )
+            elif tool_name == "get_events":
+                result = handle_get_events(
+                    session_id=tool_input.get("session_id", self.shared_session_id),
+                    agent_name=tool_input.get("agent_name"),
+                    event_type=tool_input.get("event_type"),
+                    limit=tool_input.get("limit"),
+                )
+            elif tool_name == "send_email_smtp":
+                result = handle_send_email_smtp(tool_input)
+            else:
+                result = {"ok": False, "error": f"Unknown tool: {tool_name}"}
+        except Exception as e:
+            result = {"ok": False, "error": f"Tool execution failed: {type(e).__name__}: {e}"}
+            self.logger.error(f"tool_call failed: {tool_name}", error=e, agent=agent_name)
+
+        if not result.get("ok"):
+            self.logger.warn(
+                f"tool_result error: {tool_name}",
+                agent=agent_name,
+                tool=tool_name,
+                error=result.get("error"),
             )
-        elif tool_name == "get_events":
-            result = handle_get_events(
-                session_id=tool_input.get("session_id", self.shared_session_id),
-                agent_name=tool_input.get("agent_name"),
-                event_type=tool_input.get("event_type"),
-            )
-        elif tool_name == "send_email_smtp":
-            result = handle_send_email_smtp(tool_input)
-        else:
-            result = {"ok": False, "error": f"Unknown tool: {tool_name}"}
 
         self.client.beta.sessions.events.send(
             session_id=session_id,
@@ -301,26 +161,50 @@ class AgentRunner:
         return result
 
     def run(self, agent_id: str, agent_name: str, prompt: str) -> Dict[str, Any]:
-        """Run a single agent with shared_session_id passed in initial message."""
+        """Run a single agent with timeout, retry, and observability."""
         full_prompt = f"session_id: {self.shared_session_id}\n\n{prompt}"
+        timeout = AGENT_TIMEOUTS.get(agent_name, 300)
+        criticality = AGENT_CRITICALITY.get(agent_name, "optional")
 
-        print(f"\n[{agent_name}] Creating session...", flush=True)
+        self.logger.info(
+            f"agent_start: {agent_name}",
+            agent=agent_name,
+            criticality=criticality,
+            timeout_sec=timeout,
+        )
+        if self.tracker:
+            self.tracker.start_agent(agent_name)
+
         start = time.time()
 
-        session = self.client.beta.sessions.create(
-            agent=agent_id,
-            environment_id=ENVIRONMENT_ID,
-            title=f"{agent_name}_{self.shared_session_id}",
-        )
+        try:
+            # Retry on transient API errors (rate limits, 5xx, network)
+            session = retry_call(
+                lambda: self.client.beta.sessions.create(
+                    agent=agent_id,
+                    environment_id=ENVIRONMENT_ID,
+                    title=f"{agent_name}_{self.shared_session_id}",
+                ),
+                max_attempts=3,
+                initial_delay=2.0,
+                is_retryable=is_retryable_anthropic_error,
+                logger=self.logger,
+                func_name=f"create_session_{agent_name}",
+            )
+        except Exception as e:
+            self.logger.error(f"agent_start failed: {agent_name}", error=e, agent=agent_name)
+            if self.tracker:
+                self.tracker.end_agent(agent_name, status="failed", error=str(e))
+            return {"output": "", "elapsed": 0, "tool_calls": 0, "error": str(e)}
+
         session_id = session.id
-        print(f"[{agent_name}] Session: {session_id}", flush=True)
 
         final_text = ""
         tool_calls = 0
+        usage = {}
 
         try:
             with self.client.beta.sessions.events.stream(session_id=session_id) as stream:
-                # Send initial message
                 self.client.beta.sessions.events.send(
                     session_id=session_id,
                     events=[{
@@ -330,51 +214,93 @@ class AgentRunner:
                 )
 
                 for event in stream:
+                    # Check timeout
+                    if time.time() - start > timeout:
+                        self.logger.error(
+                            f"agent_timeout: {agent_name}",
+                            agent=agent_name,
+                            elapsed=time.time() - start,
+                            limit=timeout,
+                        )
+                        break
+
                     etype = event.type
 
                     if etype == "agent.message":
                         for block in event.content:
                             if getattr(block, "type", None) == "text":
                                 final_text += block.text
-
                     elif etype == "agent.custom_tool_use":
                         tool_calls += 1
-                        tool_name = getattr(event, "tool_name", None) or getattr(event, "name", None)
-                        print(f"[{agent_name}] Tool call #{tool_calls}: {tool_name}", flush=True)
                         self.handle_tool_call(event, session_id, agent_name)
-
                     elif etype == "session.status_idle":
-                        reason_type = getattr(getattr(event, "stop_reason", None), "type", None)
-                        if reason_type == "requires_action":
+                        stop_reason = getattr(event, "stop_reason", None)
+                        if stop_reason and getattr(stop_reason, "type", None) == "requires_action":
                             continue
-                        # Agent is done
+                        # Try to capture usage if available
+                        if hasattr(event, "usage"):
+                            usage = {
+                                "input_tokens": getattr(event.usage, "input_tokens", 0),
+                                "output_tokens": getattr(event.usage, "output_tokens", 0),
+                                "cache_read_input_tokens": getattr(event.usage, "cache_read_input_tokens", 0),
+                            }
                         break
-
                     elif etype == "session.status_terminated":
                         break
-
                     elif etype == "session.error":
-                        print(f"[{agent_name}] ERROR: {getattr(event, 'error', event)}", flush=True)
+                        err = getattr(event, "error", None)
+                        self.logger.error(
+                            f"session_error: {agent_name}",
+                            agent=agent_name,
+                            session_error=str(err),
+                        )
                         break
-
         except Exception as e:
-            print(f"[{agent_name}] Exception: {type(e).__name__}: {e}", flush=True)
+            self.logger.error(f"agent_run failed: {agent_name}", error=e, agent=agent_name)
+            if self.tracker:
+                self.tracker.end_agent(agent_name, status="failed", error=str(e))
+            return {"output": final_text, "elapsed": time.time() - start, "tool_calls": tool_calls, "error": str(e)}
 
         elapsed = time.time() - start
-        print(f"[{agent_name}] Done in {elapsed:.1f}s ({tool_calls} tool calls)", flush=True)
+        self.logger.info(
+            f"agent_end: {agent_name}",
+            agent=agent_name,
+            elapsed_sec=round(elapsed, 2),
+            tool_calls=tool_calls,
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            cache_read_tokens=usage.get("cache_read_input_tokens", 0),
+        )
+        if self.tracker:
+            self.tracker.end_agent(
+                agent_name,
+                status="success",
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                cache_read_tokens=usage.get("cache_read_input_tokens", 0),
+            )
 
         return {
-            "agent_session_id": session_id,
+            "agent": agent_name,
+            "session_id": session_id,
             "output": final_text,
             "elapsed": elapsed,
             "tool_calls": tool_calls,
+            "usage": usage,
         }
 
 
 # ============================================================================
-# ORCHESTRATOR
+# ORCHESTRATOR (Step-Based)
 # ============================================================================
 class OrchestratorV2:
+    """
+    Step-based orchestrator that can run end-to-end OR one step at a time.
+
+    For local/long-running: call orchestrate() to run full pipeline.
+    For Vercel (timeout-bound): call run_step(step_name) for each step.
+    """
+
     def __init__(self, resume_session_id: Optional[str] = None):
         self.client = anthropic.Anthropic()
         if resume_session_id:
@@ -383,32 +309,42 @@ class OrchestratorV2:
                 self.session_id = resume_session_id
                 self.resumed = True
                 event_types = [e["event_type"] for e in existing["events"]]
-                print(f"\n>>> RESUMING session {self.session_id}")
-                print(f"    {len(existing['events'])} prior events: {event_types}")
+                print(f"\n>>> RESUMING session {self.session_id}", flush=True)
+                print(f"    {len(existing['events'])} prior events: {event_types}", flush=True)
             else:
-                print(f"\n>>> No prior events for {resume_session_id}; starting fresh")
+                print(f"\n>>> No prior events for {resume_session_id}; starting fresh", flush=True)
                 self.session_id = self._new_session_id()
                 self.resumed = False
         else:
             self.session_id = self._new_session_id()
             self.resumed = False
-        self.runner = AgentRunner(self.client, self.session_id)
-        print(f"\n{'=' * 70}")
-        print(f"SHARED SESSION ID: {self.session_id}")
-        print(f"{'=' * 70}")
+
+        self.logger = StructuredLogger(session_id=self.session_id)
+        self.tracker = RunTracker(self.session_id)
+        self.runner = AgentRunner(
+            self.client, self.session_id,
+            logger=self.logger, tracker=self.tracker,
+        )
+
+        self.logger.info(
+            f"orchestrator_init",
+            session_id=self.session_id,
+            resumed=self.resumed,
+        )
 
     @staticmethod
     def _new_session_id() -> str:
         return f"newsletter_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
     def _has_event(self, event_type: str) -> bool:
-        result = handle_get_events(session_id=self.session_id, event_type=event_type)
-        return bool(result.get("ok")) and len(result.get("events", [])) > 0
+        return has_event(self.session_id, event_type)
 
     def _count_events(self, event_type: str) -> int:
-        result = handle_get_events(session_id=self.session_id, event_type=event_type)
-        return len(result.get("events", [])) if result.get("ok") else 0
+        return count_events(self.session_id, event_type)
 
+    # ========================================================================
+    # INDIVIDUAL STEPS (each runs independently, can be one Vercel fn each)
+    # ========================================================================
     def step_memory(self):
         return self.runner.run(
             AGENTS["memory"], "memory",
@@ -416,7 +352,7 @@ class OrchestratorV2:
         )
 
     def step_research_parallel(self):
-        print("\n>>> Running Research agents in parallel...", flush=True)
+        self.logger.info("step_research_parallel_start")
         with ThreadPoolExecutor(max_workers=2) as executor:
             f_l = executor.submit(self.runner.run, AGENTS["research_launches"], "research_launches",
                 "Find 5-7 significant AI ecosystem developments from past 7 days "
@@ -455,74 +391,116 @@ class OrchestratorV2:
         )
 
     def check_critic_decision(self) -> bool:
-        result = handle_get_events(session_id=self.session_id, event_type="draft_approved")
-        return result.get("ok") and len(result.get("events", [])) > 0
+        return self._has_event("draft_approved")
 
-    def orchestrate(self):
-        print("\n" + "=" * 70)
-        print("MULTI-AGENT ORCHESTRATOR V2 - SHARED SESSION")
-        if self.resumed:
-            print("MODE: RESUME (skipping steps whose terminal event already exists)")
-        print("=" * 70)
-        total_start = time.time()
+    # ========================================================================
+    # STEP-BASED EXECUTION (one step per call, for Vercel)
+    # ========================================================================
+    def run_step(self, step_name: str) -> Dict[str, Any]:
+        """
+        Run one logical step. Used by Vercel to chain functions.
+
+        Returns:
+            {
+                "step": str,
+                "completed": bool,
+                "next_step": Optional[str],
+                "needs_retry": bool,  # for write_critique loop
+                "results": dict,
+                "session_id": str,
+            }
+        """
+        self.logger.info(f"step_run: {step_name}", step=step_name)
         results: Dict[str, Any] = {}
 
-        # If the run already completed, exit early.
-        if self._has_event("email_sent"):
-            print("\n>>> Session already completed (email_sent present). Nothing to do.")
-            return
+        # Already complete check (idempotent)
+        terminal_events = STEP_TERMINAL_EVENTS.get(step_name, [])
+        if terminal_events and all(self._has_event(e) for e in terminal_events):
+            self.logger.info(f"step_already_complete: {step_name}", step=step_name)
+            return {
+                "step": step_name,
+                "completed": True,
+                "next_step": self._get_next_step(step_name),
+                "results": {"skipped": True},
+                "session_id": self.session_id,
+            }
 
-        # ---- Memory ----
-        if self._has_event("covered_topics"):
-            print("\n>>> [resume] Skipping memory — covered_topics already emitted")
-        else:
-            results["memory"] = self.step_memory()
+        try:
+            if step_name == "memory":
+                results["memory"] = self.step_memory()
 
-        # ---- Parallel research ----
-        if self._has_event("launches_researched") and self._has_event("papers_researched"):
-            print("\n>>> [resume] Skipping research — both launches & papers already emitted")
-        else:
-            results["launches"], results["papers"] = self.step_research_parallel()
+            elif step_name == "research":
+                results["launches"], results["papers"] = self.step_research_parallel()
+                # Post-condition fallbacks
+                for required, key in (("launches_researched", "launches"),
+                                       ("papers_researched", "papers")):
+                    if not self._has_event(required):
+                        self.logger.warn(
+                            f"auto_insert_placeholder: {required}",
+                            event_type=required,
+                            reason="research agent did not emit terminal event",
+                        )
+                        handle_emit_event(
+                            session_id=self.session_id,
+                            agent_name="orchestrator",
+                            event_type=required,
+                            data={
+                                key: [],
+                                "note": "Auto-inserted by orchestrator: research agent did not emit a terminal event.",
+                                "auto_inserted": True,
+                            },
+                        )
 
-        # Post-condition: belt-and-suspenders. The Evaluator blocks on both
-        # terminal events existing. If a research agent silently exited without
-        # emitting (observed: Papers agent did this in 2 of 3 early runs), insert
-        # an empty placeholder so the pipeline can proceed and so the failure is
-        # visible in the briefs log rather than silent.
-        for required, key in (("launches_researched", "launches"),
-                               ("papers_researched", "papers")):
-            if not self._has_event(required):
-                print(f"\n>>> WARNING: {required} missing after research step. "
-                      f"Inserting empty placeholder so Evaluator can proceed.",
-                      flush=True)
-                handle_emit_event(
-                    session_id=self.session_id,
-                    agent_name="orchestrator",
-                    event_type=required,
-                    data={
-                        key: [],
-                        "note": "Auto-inserted by orchestrator: research agent did not emit a terminal event.",
-                        "auto_inserted": True,
-                    },
-                )
-                results.setdefault("auto_inserted_events", []).append(required)
+            elif step_name == "evaluate":
+                results["evaluator"] = self.step_evaluate()
 
-        # ---- Evaluator ----
-        if self._has_event("items_evaluated"):
-            print("\n>>> [resume] Skipping evaluator — items_evaluated already emitted")
-        else:
-            results["evaluator"] = self.step_evaluate()
+            elif step_name == "write_critique":
+                results.update(self._run_write_critique_loop())
 
-        # ---- Writer / Critic loop, state-driven so it resumes correctly ----
+            elif step_name == "deliver":
+                results["delivery"] = self.step_deliver()
+
+            else:
+                return {
+                    "step": step_name,
+                    "completed": False,
+                    "error": f"Unknown step: {step_name}",
+                    "session_id": self.session_id,
+                }
+
+            completed = all(self._has_event(e) for e in terminal_events) if terminal_events else True
+            return {
+                "step": step_name,
+                "completed": completed,
+                "next_step": self._get_next_step(step_name) if completed else None,
+                "results": results,
+                "session_id": self.session_id,
+            }
+
+        except Exception as e:
+            self.logger.error(f"step_failed: {step_name}", error=e, step=step_name)
+            return {
+                "step": step_name,
+                "completed": False,
+                "error": str(e),
+                "session_id": self.session_id,
+            }
+
+    def _get_next_step(self, current_step: str) -> Optional[str]:
+        try:
+            idx = STEP_ORDER.index(current_step)
+            return STEP_ORDER[idx + 1] if idx + 1 < len(STEP_ORDER) else None
+        except ValueError:
+            return None
+
+    def _run_write_critique_loop(self) -> Dict[str, Any]:
+        """Writer/Critic loop, state-driven, max 2 retries."""
+        results = {}
         max_retries = 2
         approved = self._has_event("draft_approved")
         if approved:
-            print("\n>>> [resume] Draft already approved — skipping writer/critic")
+            return {"already_approved": True}
 
-        # Loop driven by counts of draft_written vs critic_rejection events.
-        # If they're equal, the latest action was a rejection (or no draft yet)
-        # and we need a new writer pass. If drafts > rejections, a fresh draft
-        # is awaiting critique.
         loop_safety = 0
         while not approved and loop_safety < 10:
             loop_safety += 1
@@ -530,69 +508,138 @@ class OrchestratorV2:
             rejections = self._count_events("critic_rejection")
 
             if drafts == 0 or rejections >= drafts:
-                # Need to write (initial or after rejection)
                 if drafts > max_retries:
-                    print(f"\n>>> Max writer retries ({max_retries}) reached. Stopping.")
+                    self.logger.warn("max_writer_retries_reached", retries=max_retries)
                     break
                 attempt = drafts + 1
                 retry_msg = ("Previous draft was rejected. Read critic_rejection event "
                              "and address all issues.") if drafts > 0 else ""
-                print(f"\n>>> Writer attempt {attempt}")
+                self.logger.info(f"writer_attempt_{attempt}", attempt=attempt)
                 results[f"writer_v{attempt}"] = self.step_write(retry_msg=retry_msg)
                 continue
 
-            # drafts > rejections: a fresh draft is waiting for the critic
             attempt = rejections + 1
-            print(f"\n>>> Critic attempt {attempt}")
+            self.logger.info(f"critic_attempt_{attempt}", attempt=attempt)
             results[f"critic_v{attempt}"] = self.step_critique()
             if self.check_critic_decision():
-                print(f"\n>>> Critic APPROVED on attempt {attempt}")
+                self.logger.info(f"critic_approved", attempt=attempt)
                 approved = True
 
-        if not approved:
-            print("\n>>> Did not reach approval. Stopping before delivery.")
+        return results
+
+    # ========================================================================
+    # FULL PIPELINE (for local/long-running execution)
+    # ========================================================================
+    def orchestrate(self):
+        """Run full pipeline end-to-end. For local use."""
+        self.logger.info("orchestrate_start")
+        total_start = time.time()
+        results: Dict[str, Any] = {}
+
+        if self._has_event("email_sent"):
+            self.logger.info("already_completed")
+            print("\n>>> Session already completed (email_sent present). Nothing to do.", flush=True)
             return
 
-        # ---- Delivery ----
+        # Step 1: Memory
+        if self._has_event("covered_topics"):
+            self.logger.info("step_skipped: memory")
+        else:
+            results["memory"] = self.step_memory()
+
+        # Step 2: Parallel Research
+        if self._has_event("launches_researched") and self._has_event("papers_researched"):
+            self.logger.info("step_skipped: research")
+        else:
+            results["launches"], results["papers"] = self.step_research_parallel()
+
+        # Auto-insert placeholders for silent failures
+        for required, key in (("launches_researched", "launches"),
+                               ("papers_researched", "papers")):
+            if not self._has_event(required):
+                self.logger.warn(f"auto_insert_placeholder: {required}", event_type=required)
+                handle_emit_event(
+                    session_id=self.session_id,
+                    agent_name="orchestrator",
+                    event_type=required,
+                    data={
+                        key: [],
+                        "note": "Auto-inserted by orchestrator.",
+                        "auto_inserted": True,
+                    },
+                )
+
+        # Step 3: Evaluator
+        if self._has_event("items_evaluated"):
+            self.logger.info("step_skipped: evaluate")
+        else:
+            results["evaluator"] = self.step_evaluate()
+
+        # Step 4: Writer/Critic loop
+        if not self._has_event("draft_approved"):
+            results.update(self._run_write_critique_loop())
+
+        if not self._has_event("draft_approved"):
+            self.logger.error("did_not_reach_approval")
+            print("\n>>> Did not reach approval. Stopping before delivery.", flush=True)
+            self._finalize(results, success=False)
+            return
+
+        # Step 5: Delivery
         if self._has_event("email_sent"):
-            print("\n>>> [resume] Email already sent — done")
+            self.logger.info("step_skipped: delivery")
         else:
             results["delivery"] = self.step_deliver()
 
         total = time.time() - total_start
-        print("\n" + "=" * 70)
-        print(f"COMPLETE. Total: {total:.1f}s")
-        print(f"Session: {self.session_id}")
-        print("=" * 70)
+        self.logger.info(f"orchestrate_complete", total_elapsed_sec=round(total, 2))
+        print(f"\n>>> COMPLETE. Total: {total:.1f}s", flush=True)
+        print(f">>> Session: {self.session_id}", flush=True)
 
+        self._finalize(results, success=True)
+
+    def _finalize(self, results: Dict[str, Any], success: bool):
+        """Persist run summary and metadata."""
+        self.tracker.persist()
         os.makedirs("briefs", exist_ok=True)
         log_path = f"briefs/{self.session_id}_log.json"
         with open(log_path, "w") as f:
             json.dump({
                 "session_id": self.session_id,
                 "resumed": self.resumed,
-                "total_elapsed": total,
-                "approved": approved,
+                "success": success,
+                "summary": self.tracker.summary(),
                 "agents": {n: {k: v for k, v in r.items() if k != "output"}
-                          for n, r in results.items()},
+                          for n, r in results.items() if isinstance(r, dict)},
             }, f, indent=2)
-        print(f"\nLog saved: {log_path}")
+        print(f">>> Log saved: {log_path}", flush=True)
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Multi-Agent Newsletter Orchestrator (shared session pattern).",
+        description="Multi-Agent Newsletter Orchestrator (step-based, decoupled).",
     )
     parser.add_argument(
         "--session-id",
         dest="session_id",
         default=None,
-        help="Resume an existing newsletter session by id (e.g. newsletter_20260504_160649_80879d6e). "
-             "Reads session_events from Memory Stores (/mnt/memory/session_{id}.jsonl) and skips any step whose terminal event is already present.",
+        help="Resume an existing newsletter session. Reads from Memory Stores JSONL.",
+    )
+    parser.add_argument(
+        "--step",
+        dest="step",
+        default=None,
+        choices=STEP_ORDER,
+        help="Run only one step (for Vercel function chaining).",
     )
     return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    OrchestratorV2(resume_session_id=args.session_id).orchestrate()
+    orch = OrchestratorV2(resume_session_id=args.session_id)
+    if args.step:
+        result = orch.run_step(args.step)
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        orch.orchestrate()

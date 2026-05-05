@@ -1,0 +1,89 @@
+name: Newsletter Weekly Run
+
+on:
+  schedule:
+    # Every Thursday at 9:00 AM UTC
+    - cron: '0 9 * * 4'
+  workflow_dispatch:
+    # Allow manual trigger from GitHub UI
+    inputs:
+      session_id:
+        description: 'Resume an existing session ID (optional)'
+        required: false
+        type: string
+
+jobs:
+  generate-newsletter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write  # needed to commit latest_issue.* back
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run orchestrator
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST || 'smtp.gmail.com' }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: |
+          if [ -n "${{ inputs.session_id }}" ]; then
+            echo "Resuming session: ${{ inputs.session_id }}"
+            python3 orchestrator_v2.py --session-id "${{ inputs.session_id }}"
+          else
+            echo "Starting fresh run"
+            python3 orchestrator_v2.py
+          fi
+
+      - name: Commit latest issue back to repo
+        # Only commit if files changed (i.e., orchestrator succeeded)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Force-add since these are gitignored
+          git add -f latest_issue.html latest_issue.md latest_issue_meta.json 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to latest_issue.* — nothing to commit"
+          else
+            git commit -m "newsletter: automated weekly update [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git push
+            echo "✓ Pushed latest issue to repo (Vercel will auto-deploy)"
+          fi
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-logs-${{ github.run_id }}
+          path: |
+            logs/
+            runs/
+            briefs/
+            memory_local/
+          retention-days: 30
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Newsletter run failed. Check logs above and artifacts."
+          # Optional: send email/Slack notification on failure

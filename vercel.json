@@ -1,5 +1,16 @@
 {
   "version": 2,
+  "functions": {
+    "api/orchestrate.py": {
+      "maxDuration": 10
+    },
+    "api/step.py": {
+      "maxDuration": 60
+    },
+    "api/status.py": {
+      "maxDuration": 10
+    }
+  },
   "env": {
     "ANTHROPIC_API_KEY": "@anthropic_api_key",
     "SMTP_USER": "@smtp_user",
@@ -13,11 +24,5 @@
     "SMTP_FROM": "@smtp_from",
     "RECIPIENT_EMAILS": "@recipient_emails",
     "APP_BASE_URL": "@app_base_url"
-  },
-  "crons": [
-    {
-      "path": "/api/orchestrate",
-      "schedule": "0 9 * * 4"
-    }
-  ]
+  }
 }

@@ -1,17 +1,14 @@
 """
-Vercel Serverless Function: Newsletter Orchestrator
+Vercel Serverless Function: Newsletter Orchestrator Trigger
 
-Triggered by Vercel Crons on a schedule: Every Thursday at 9am UTC.
-Runs the multi-agent orchestrator to generate and send the newsletter.
+Triggered by Vercel Crons every Thursday 9am UTC.
+Starts a fresh newsletter session, then triggers the first step.
 
-Environment Variables Required:
-- ANTHROPIC_API_KEY
-- SMTP_USER
-- SMTP_PASSWORD (or from Anthropic vault)
-- RECIPIENT_EMAILS
-- APP_BASE_URL
-
-See vercel.json for cron schedule configuration.
+Why split into steps?
+- Vercel function timeout (10s/60s/900s depending on plan)
+- Full pipeline can take 5-15 min
+- Solution: each step runs in its own short function call
+- This function returns immediately after triggering step 1
 """
 
 import json
@@ -19,23 +16,20 @@ import os
 import sys
 from pathlib import Path
 
-# Add parent directory to path so we can import orchestrator_v2
+# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator_v2 import OrchestratorV2
+import urllib.request
+
+from orchestrator_v2 import OrchestratorV2, STEP_ORDER
+from observability import StructuredLogger
 
 
 def handler(request):
-    """
-    Vercel serverless function handler.
+    """Cron trigger: start a fresh newsletter run, kick off step 1."""
+    base_url = os.getenv("APP_BASE_URL", "")
 
-    Called by Vercel Crons on schedule. Runs a fresh newsletter generation.
-
-    Returns:
-        JSON response with session_id, status, and summary
-    """
-
-    # Verify required environment variables
+    # Verify required env vars
     required_vars = ["ANTHROPIC_API_KEY", "SMTP_USER", "SMTP_PASSWORD", "RECIPIENT_EMAILS"]
     missing = [v for v in required_vars if not os.getenv(v)]
     if missing:
@@ -48,41 +42,50 @@ def handler(request):
         }
 
     try:
-        print("[orchestrate] Starting newsletter generation...", flush=True)
+        # Create session (does not run any agent yet — just initializes)
+        orch = OrchestratorV2(resume_session_id=None)
+        session_id = orch.session_id
+        logger = StructuredLogger(session_id=session_id, agent_name="cron_trigger")
 
-        # Initialize and run orchestrator (fresh session, no resume)
-        orchestrator = OrchestratorV2(resume_session_id=None)
-        session_id = orchestrator.session_id
+        logger.info(
+            "newsletter_run_started",
+            trigger="vercel_cron",
+            first_step=STEP_ORDER[0],
+        )
 
-        # Run the full pipeline
-        orchestrator.orchestrate()
-
-        print(f"[orchestrate] Session {session_id} completed successfully", flush=True)
+        # Fire-and-forget: trigger step 1 without waiting
+        # (in production, use a queue like QStash, AWS SQS, or background fn)
+        first_step = STEP_ORDER[0]
+        if base_url:
+            try:
+                step_url = f"{base_url}/api/step?session_id={session_id}&step={first_step}"
+                # Use timeout=1 — we want fire-and-forget
+                req = urllib.request.Request(step_url, method="GET")
+                urllib.request.urlopen(req, timeout=2)
+            except Exception as e:
+                # Don't fail — step can be triggered manually if needed
+                logger.warn(f"could_not_trigger_step_async", error_type=type(e).__name__, error_message=str(e))
 
         return {
             "statusCode": 200,
             "body": json.dumps({
                 "success": True,
                 "session_id": session_id,
-                "message": "Newsletter generated and sent successfully",
+                "first_step": first_step,
+                "message": f"Newsletter run started. Triggered {first_step} step asynchronously.",
+                "monitor_url": f"{base_url}/api/status?session_id={session_id}" if base_url else None,
             }),
         }
 
     except Exception as e:
-        error_msg = f"{type(e).__name__}: {str(e)}"
-        print(f"[orchestrate] ERROR: {error_msg}", flush=True)
-
         return {
             "statusCode": 500,
             "body": json.dumps({
                 "success": False,
-                "error": error_msg,
-                "message": "Failed to generate newsletter",
+                "error": f"{type(e).__name__}: {str(e)}",
             }),
         }
 
 
-# For local testing (e.g., `python3 api/orchestrate.py`)
 if __name__ == "__main__":
-    result = handler(None)
-    print(json.dumps(result, indent=2))
+    print(json.dumps(handler(None), indent=2))

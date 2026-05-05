@@ -1,27 +1,31 @@
 # AI Weekly
 
-A weekly AI newsletter, written end-to-end by **7 Anthropic Managed Agents** coordinating through a shared event log in Supabase.
+A weekly AI newsletter, written end-to-end by **7 Anthropic Managed Agents** coordinating through a shared session log (Anthropic Memory Stores).
 
 🌐 **Live:** [ai-weekly-ecru.vercel.app](https://ai-weekly-ecru.vercel.app)
-📐 **Design:** [ARCHITECTURE.md](./ARCHITECTURE.md) · [diagram](./architecture_diagram.svg)
+📐 **Design:** [ARCHITECTURE.md](./ARCHITECTURE.md) · [Deployment](./DEPLOYMENT.md) · [diagram](./architecture_diagram.svg)
 
 ---
 
 ## What it does
 
-Generates one issue of *The Weekly Signal* per run — research → evaluate → write → critique → deliver, autonomous. A small Flask app on Vercel handles subscribe / unsubscribe / latest-issue / admin.
+Generates one issue of *The Weekly Signal* per run — research → evaluate → write → critique → deliver, autonomous. Runs every Thursday 9am UTC via GitHub Actions. A small Flask app on Vercel handles subscribe / unsubscribe / latest-issue / admin.
 
 ## How it's built
 
 ```
+GitHub Actions Cron (Thursday 9am UTC)
+  ↓
 Memory  →  Research Launches  ⎫
                               ⎬→  Evaluator → Writer ⇄ Critic → Delivery
            Research Papers    ⎭                  (max 2 retries)
+  ↓
+Email sent + latest_issue.html committed → Vercel auto-deploys
 ```
 
-Seven specialized Managed Agents talk through a shared Supabase event log (`session_events`) via three custom tools: `emit_event`, `get_events`, `send_email_smtp`. Full design in [ARCHITECTURE.md](./ARCHITECTURE.md).
+Seven specialized Managed Agents talk through a shared event log (Anthropic Memory Stores) via custom tools (`emit_event`, `get_events`, `send_email_smtp`). Each tool is its own decoupled module ("many hands" pattern). Full design in [ARCHITECTURE.md](./ARCHITECTURE.md).
 
-**Stack:** Anthropic Managed Agents (Opus 4.7 + Haiku 4.5) · Supabase · Flask + Vercel · SMTP · Python 3.11.
+**Stack:** Anthropic Managed Agents (Opus 4.7 + Haiku 4.5) · Memory Stores · GitHub Actions · Flask + Vercel · SMTP · Python 3.11.
 
 ## Quick start
 
@@ -51,12 +55,23 @@ Note: Session state is persisted in **Anthropic Memory Stores** (`/mnt/memory/` 
 ## Run
 
 ```bash
-python3 orchestrator_v2.py                                # generate + send
-python3 orchestrator_v2.py --session-id newsletter_…      # resume a partial run
-python3 app.py                                            # subscribe site, http://127.0.0.1:5000
+# Local: full pipeline
+python3 orchestrator_v2.py
+
+# Local: resume a partial run
+python3 orchestrator_v2.py --session-id newsletter_…
+
+# Local: run a single step (debug)
+python3 orchestrator_v2.py --session-id newsletter_… --step evaluate
+
+# Web layer locally
+python3 app.py                  # http://127.0.0.1:5000
+
+# Production: GitHub Actions runs every Thursday 9am UTC automatically
+# Manual trigger: GitHub Actions tab → "Newsletter Weekly Run" → Run workflow
 ```
 
-## Routes (web layer)
+## Routes (Vercel web layer)
 
 | Route                         | Method | What it does |
 |-------------------------------|--------|--------------|
@@ -65,20 +80,36 @@ python3 app.py                                            # subscribe site, http
 | `/unsubscribe?email=<addr>`   | GET    | Remove email |
 | `/latest`                     | GET    | Serve the most recent issue |
 | `/admin`                      | GET    | Subscriber list |
+| `/api/status?session_id=<id>` | GET    | Live state of a run |
+| `/api/status?recent=true`     | GET    | Last 20 runs |
 
 ## Files
 
 | Path | Purpose |
 |---|---|
-| `orchestrator_v2.py`         | Multi-agent orchestrator + custom tools + resume |
-| `email_renderer.py`          | Editorial HTML email rendering |
-| `app.py`                     | Flask app: subscribe / unsubscribe / latest / admin |
-| `index.py`                   | Vercel serverless entrypoint |
-| `templates/`                 | Subscribe page template |
-| `briefs/`                    | Per-run JSON logs (gitignored) |
-| `latest_issue.*`             | Snapshot of the most recent send (gitignored) |
-| `ARCHITECTURE.md`            | Full design write-up |
-| `architecture_diagram.svg`   | One-page system diagram |
+| `orchestrator_v2.py`           | Multi-agent orchestrator (step-based) + AgentRunner |
+| `tools/memory_store.py`        | Hand 1: emit_event, get_events |
+| `tools/email.py`               | Hand 2: send_email_smtp |
+| `observability.py`             | Structured JSON logger, RunTracker, run history |
+| `retry.py`                     | Exponential backoff retry decorator |
+| `credentials.py`               | Credential manager |
+| `email_renderer.py`            | Editorial HTML email rendering |
+| `app.py`                       | Flask web app |
+| `index.py`                     | Vercel serverless entrypoint |
+| `api/orchestrate.py`           | (Vercel) Manual trigger endpoint |
+| `api/step.py`                  | (Vercel) Single-step runner |
+| `api/status.py`                | (Vercel) Run status / recent runs |
+| `.github/workflows/newsletter.yml` | GitHub Actions: weekly cron + manual trigger |
+| `vercel.json`                  | Vercel config (web layer only, no cron) |
+| `templates/`                   | Subscribe page template |
+| `briefs/`                      | Per-run JSON logs (gitignored) |
+| `logs/`                        | Per-session structured logs (gitignored) |
+| `runs/`                        | Run summary metrics (gitignored) |
+| `memory_local/`                | Local Memory Stores fallback (gitignored) |
+| `latest_issue.*`               | Latest newsletter (committed by GitHub Actions) |
+| `ARCHITECTURE.md`              | Full design write-up |
+| `DEPLOYMENT.md`                | Setup instructions |
+| `architecture_diagram.svg`     | One-page system diagram |
 
 ## Cost
 

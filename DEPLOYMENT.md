@@ -1,243 +1,292 @@
-# Deployment Guide: AI Weekly on Vercel
+# Deployment Guide: AI Weekly
 
-Automated weekly newsletter generation via Vercel Crons.
+**Architecture:** GitHub Actions for orchestration + Vercel for web layer.
+
+```
+GitHub Actions (Thursday 9am UTC)
+     ↓
+Runs: python3 orchestrator_v2.py
+     ↓
+7 Managed Agents → newsletter generated → email sent
+     ↓
+Commits latest_issue.html back to repo
+     ↓
+Vercel auto-deploys → /latest endpoint serves new issue
+```
+
+**Why this split?**
+- Vercel Hobby: 60s function timeout (won't fit our 5-15min pipeline)
+- GitHub Actions: 6-hour timeout, free, simple YAML config
+- Vercel: still hosts subscribe form, /latest, /admin, /unsubscribe
 
 ---
 
 ## Prerequisites
 
-- Vercel account (free tier works)
-- GitHub repo connected to Vercel (or use Vercel CLI)
-- Environment variables ready (see below)
+- ✅ GitHub repo with this code pushed
+- ✅ Vercel account with Hobby tier (free)
+- ✅ Vercel project linked to your GitHub repo
 
 ---
 
-## Step 1: Set Up Environment Variables in Vercel
+## Step 1: Configure GitHub Secrets
 
-Go to **Vercel Dashboard** → Your Project → **Settings** → **Environment Variables**
+Go to your **GitHub repo** → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
 
-Add these variables:
+Add these secrets:
 
-| Variable | Value | Required |
-|----------|-------|----------|
+| Secret Name | Value | Required |
+|-------------|-------|----------|
 | `ANTHROPIC_API_KEY` | Your Anthropic API key | ✅ Yes |
-| `SMTP_USER` | Gmail address (or SMTP user) | ✅ Yes |
-| `SMTP_PASSWORD` | Gmail app password (or SMTP password) | ✅ Yes |
+| `SMTP_USER` | Gmail address | ✅ Yes |
+| `SMTP_PASSWORD` | Gmail App Password | ✅ Yes |
 | `RECIPIENT_EMAILS` | `email1@x.com,email2@y.com` | ✅ Yes |
 | `APP_BASE_URL` | `https://your-domain.vercel.app` | ✅ Yes |
 | `SMTP_HOST` | `smtp.gmail.com` (default) | ❌ No |
 | `SMTP_PORT` | `587` (default) | ❌ No |
-| `SMTP_FROM` | Sender email (defaults to SMTP_USER) | ❌ No |
+| `SMTP_FROM` | Sender (defaults to SMTP_USER) | ❌ No |
 
-### For Gmail Users:
-1. Enable 2FA on your Google account
-2. Generate an App Password: https://myaccount.google.com/apppasswords
-3. Use the 16-character app password as `SMTP_PASSWORD`
-
----
-
-## Step 2: Deploy to Vercel
-
-### Option A: GitHub Integration (Recommended)
-
-1. Push your code to GitHub:
-   ```bash
-   cd /Users/pranamyavadlamani/Desktop/agent_app
-   git add .
-   git commit -m "feat: add Vercel orchestrator with crons"
-   git push origin main
-   ```
-
-2. Vercel auto-deploys on push (if configured)
-
-3. Verify deployment:
-   - Vercel Dashboard → Deployments → Check latest is green ✅
-
-### Option B: Vercel CLI
-
-1. Install CLI (if not already):
-   ```bash
-   npm install -g vercel
-   ```
-
-2. Deploy:
-   ```bash
-   cd /Users/pranamyavadlamani/Desktop/agent_app
-   vercel --prod
-   ```
-
-3. Follow prompts to link project
+### Gmail App Password:
+1. Enable 2FA: https://myaccount.google.com/security
+2. Generate App Password: https://myaccount.google.com/apppasswords
+3. Use the 16-character password as `SMTP_PASSWORD`
 
 ---
 
-## Step 3: Verify Cron is Active
+## Step 2: Configure Vercel Environment Variables
 
-1. Go to **Vercel Dashboard** → Your Project
-2. Look for **Crons** tab (or **Settings** → **Crons**)
-3. You should see:
-   ```
-   /api/orchestrate
-   Schedule: 0 9 * * 4 (Every Thursday at 9:00 AM UTC)
-   Status: Active ✅
-   ```
+These are needed for the web layer (status endpoint, /latest serving).
+
+Go to **Vercel Dashboard** → Your Project → **Settings** → **Environment Variables**
+
+Same secrets as GitHub (Vercel needs them for the Flask app + status endpoint).
 
 ---
 
-## Step 4: Test the Orchestrator (Optional)
-
-### Test the endpoint manually:
+## Step 3: Push Code to GitHub
 
 ```bash
-curl https://your-domain.vercel.app/api/orchestrate
+cd /Users/pranamyavadlamani/Desktop/agent_app
+git add .
+git commit -m "deploy: github actions + vercel web layer"
+git push origin main
 ```
 
-Response should be:
-```json
-{
-  "success": true,
-  "session_id": "newsletter_YYYYMMDD_HHMMSS_xxxxxxxx",
-  "message": "Newsletter generated and sent successfully"
-}
+Vercel auto-deploys the web layer.
+GitHub Actions auto-installs the workflow.
+
+---
+
+## Step 4: Verify GitHub Actions Workflow
+
+1. Go to **GitHub repo** → **Actions** tab
+2. You should see **"Newsletter Weekly Run"** workflow
+3. Click on it → see the schedule (every Thursday 9am UTC)
+
+---
+
+## Step 5: Test Manually (Recommended)
+
+Before waiting until Thursday, trigger manually:
+
+1. Go to **Actions** tab → **Newsletter Weekly Run**
+2. Click **"Run workflow"** button (top right)
+3. Leave session_id blank, click **Run workflow**
+4. Watch the logs
+
+Expected output:
+```
+✓ Setup Python
+✓ Install dependencies
+✓ Run orchestrator
+  - Memory agent runs
+  - Research (parallel) runs
+  - Evaluator runs
+  - Writer/Critic loop runs
+  - Delivery runs (email sent)
+✓ Commit latest issue back to repo
+✓ Upload run artifacts
 ```
 
-### Monitor logs:
-
-Vercel Dashboard → Your Project → **Functions** → `api/orchestrate.py` → View logs
+After successful run:
+- ✅ Email sent to RECIPIENT_EMAILS
+- ✅ `latest_issue.html` committed to repo
+- ✅ Vercel auto-deploys the new issue
+- ✅ `/latest` page shows new newsletter
 
 ---
 
 ## How It Works
 
-### Weekly Schedule:
-- **Time:** Every Thursday at 9:00 AM UTC
-- **What happens:**
-  1. Vercel triggers `/api/orchestrate`
-  2. `orchestrate.py` runs `OrchestratorV2().orchestrate()`
-  3. 7 Managed Agents run: Memory → Launches → Papers → Evaluator → Writer → Critic → Delivery
-  4. Newsletter emailed to all subscribers
-  5. `latest_issue.html` saved for `/latest` endpoint
-  6. Session log written to `/memory_local/` or `/mnt/memory/`
+### Schedule: Every Thursday 9am UTC
 
-### Changing the Schedule:
-
-Edit `vercel.json`:
-```json
-"crons": [
-  {
-    "path": "/api/orchestrate",
-    "schedule": "0 9 * * 4"  ← Change this (4 = Thursday)
-  }
-]
+In `.github/workflows/newsletter.yml`:
+```yaml
+on:
+  schedule:
+    - cron: '0 9 * * 4'   # Thursday 9am UTC
 ```
 
-Redeploy and verify in Vercel Dashboard.
+### Manual Trigger / Resume
 
-**Common schedules:**
+In GitHub Actions UI, click "Run workflow" with optional `session_id`:
+- Empty → fresh run
+- With session_id → resume from last checkpoint (uses Memory Stores)
+
+### Run Artifacts
+
+Each run uploads logs + run summary as GitHub artifacts (30-day retention):
+- `logs/` — structured JSON logs per session
+- `runs/` — run summary metrics
+- `briefs/` — full agent output logs
+- `memory_local/` — Memory Stores JSONL files
+
+Download from **Actions** → click run → **Artifacts** section
+
+### Monitoring
+
+While a run is happening:
+```bash
+# Check status (Vercel reads its own logs)
+curl https://your-domain.vercel.app/api/status?session_id=<id>
+
+# See recent runs (last 20)
+curl https://your-domain.vercel.app/api/status?recent=true
 ```
-0 9 * * 0      → Every Sunday at 9am UTC
-0 9 * * 1      → Every Monday at 9am UTC
+
+Note: Vercel's `/api/status` reads from Vercel's filesystem. Since GitHub Actions runs the orchestrator, Vercel won't have full state unless you set up shared storage. For now:
+- **GitHub Actions logs**: full visibility (real-time during run)
+- **Vercel `/latest`**: shows last published newsletter
+- **Email**: delivered to subscribers
+
+---
+
+## Changing the Schedule
+
+Edit `.github/workflows/newsletter.yml`:
+```yaml
+on:
+  schedule:
+    - cron: '0 9 * * 4'  # ← Change this
+```
+
+Common schedules:
+```
 0 9 * * 4      → Every Thursday at 9am UTC
+0 9 * * 1      → Every Monday at 9am UTC
+0 9 * * 0      → Every Sunday at 9am UTC
 0 9 * * 1-5    → Every weekday at 9am UTC
 0 0 1 * *      → First of month at midnight UTC
-*/30 * * * *   → Every 30 minutes
 ```
+
+Push the change → workflow updates automatically.
 
 ---
 
 ## Troubleshooting
 
-### Issue: Cron not running
+### Issue: Workflow not running on schedule
 
 **Check:**
-1. Is the deployment green (successful)? → Vercel Dashboard → Deployments
-2. Is the cron enabled? → Settings → Crons → `/api/orchestrate` should show "Active"
-3. Check logs: Functions → `orchestrate.py` → Logs
+1. Repo is not private with restrictions
+2. Workflow file syntax is valid (GitHub Actions tab → look for errors)
+3. Schedule cron syntax: https://crontab.guru/
+
+**Note:** GitHub Actions cron is best-effort. May run within ~15 min of scheduled time.
+
+### Issue: "Permission denied" when committing latest_issue
+
+**Fix:** Workflow already has `permissions: contents: write`. If still failing:
+1. Repo Settings → Actions → General → Workflow permissions
+2. Set to **"Read and write permissions"**
 
 ### Issue: Email not sending
 
 **Check:**
-1. SMTP credentials correct in Vercel Environment Variables
-2. Gmail: Did you generate an app password? (not your regular password)
-3. Logs: Look for SMTP error messages
+1. SMTP secrets correct in GitHub Settings → Secrets
+2. Gmail: Did you generate an app password? (not regular password)
+3. Look at workflow logs for SMTP error
 
-### Issue: Managed Agent fails
+### Issue: Anthropic API errors
 
 **Check:**
-1. `ANTHROPIC_API_KEY` is valid
-2. API key has sufficient quota/credits
-3. Agent IDs in `orchestrator_v2.py` match your Console agents
-4. Logs: Full error message in Vercel Functions logs
+1. `ANTHROPIC_API_KEY` is valid and has credits
+2. Look at logs for rate limit / quota errors
+3. Retry logic handles transient errors (3 attempts)
+
+### Issue: Long-running workflow
+
+GitHub Actions: 6 hour limit (job-level), workflow has `timeout-minutes: 30`. If your pipeline exceeds 30 min, increase `timeout-minutes` in the workflow file.
 
 ---
 
-## Monitoring & Alerts
+## Costs
 
-### Option 1: Vercel Alerts (Built-in)
+| Service | Cost | Notes |
+|---------|------|-------|
+| GitHub Actions | Free | 2000 min/month for private repos, unlimited for public |
+| Vercel Hobby | Free | Web layer only (no cron needed now) |
+| Anthropic API | ~$2-8/run | Token usage by Managed Agents |
+| Gmail SMTP | Free | Rate limited by Gmail |
 
-Vercel can email you on cron failure. Enable in:
-- **Project Settings** → **Notifications** → Configure alerts
-
-### Option 2: Manual Monitoring
-
-Check logs weekly:
-1. Vercel Dashboard → Functions → `orchestrate.py`
-2. Look for "Newsletter generated and sent successfully" message
-3. Check `/latest` endpoint to see most recent issue
-
-### Option 3: Email Confirmation
-
-Each newsletter email includes subject line with send timestamp. If you don't receive the email by expected time, something failed.
-
----
-
-## Cost & Billing
-
-- **Vercel Functions:** Free tier includes serverless execution (no extra cost)
-- **Vercel Crons:** Free tier includes up to 100 cron invocations/month
-- **Anthropic API:** You pay for tokens used (Managed Agents)
-- **Email:** SMTP via Gmail (free, rate-limited)
-
-**Estimated monthly cost:** ~$8-35 (depends on agent complexity and token usage per run)
-
----
-
-## Next Steps
-
-1. ✅ Set environment variables in Vercel Dashboard
-2. ✅ Push code to GitHub / Deploy via Vercel
-3. ✅ Verify cron is active
-4. ✅ Wait for Thursday 9am UTC (or change schedule to test sooner)
-5. ✅ Check logs to confirm success
-6. ✅ Verify email received and `/latest` endpoint updated
-
----
-
-## Updating the Code
-
-When you make changes to `orchestrator_v2.py` or any agent prompts:
-
-1. Commit and push to GitHub:
-   ```bash
-   git add .
-   git commit -m "update: improve agent prompts"
-   git push origin main
-   ```
-
-2. Vercel auto-deploys
-
-3. Your cron will use the new code on the next scheduled run
+**Monthly estimate (4 runs):** ~$8-32 in Anthropic API costs.
 
 ---
 
 ## Rollback
 
-If something breaks on the new deployment:
+If something breaks after a deployment:
 
-1. Vercel Dashboard → Deployments → Find last known good deployment
-2. Click "Rollback" or redeploy from earlier commit
+1. **Web layer (Vercel):** Dashboard → Deployments → Rollback to previous
+2. **Orchestrator (GitHub Actions):** `git revert <commit>` then push
+3. **Manual emergency stop:** Disable workflow in Actions tab → click ⋯ → Disable workflow
+
+---
+
+## Local Development
+
+```bash
+# Run orchestrator locally (uses .env file)
+python3 orchestrator_v2.py
+
+# Resume a session
+python3 orchestrator_v2.py --session-id newsletter_...
+
+# Run a single step (debug)
+python3 orchestrator_v2.py --session-id newsletter_... --step evaluate
+
+# Check status
+python3 api/status.py newsletter_...
+
+# Recent runs
+python3 api/status.py recent
+
+# Run web app locally
+python3 app.py
+# → http://127.0.0.1:5000
+```
+
+---
+
+## Migration Checklist
+
+If migrating from previous Vercel cron setup:
+
+- [x] Created `.github/workflows/newsletter.yml`
+- [x] Removed `crons` from `vercel.json`
+- [x] Updated `.gitignore` to allow `latest_issue.*`
+- [ ] Add GitHub Secrets (Settings → Secrets and variables → Actions)
+- [ ] Push code to GitHub
+- [ ] Verify workflow appears in Actions tab
+- [ ] Test with manual trigger (Run workflow button)
+- [ ] Verify email received + Vercel `/latest` updated
+- [ ] Wait for scheduled Thursday 9am run
 
 ---
 
 ## Questions?
 
-See `MIGRATION.md` for architecture details and `orchestrator_v2.py` for implementation.
+See:
+- `ARCHITECTURE.md` — full system design
+- `MIGRATION.md` — Phase 1/2/3 migration history
+- `orchestrator_v2.py` — implementation

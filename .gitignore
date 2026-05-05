@@ -3,8 +3,13 @@
 __pycache__/
 *.pyc
 .DS_Store
-latest_issue.html
-latest_issue.md
-latest_issue_meta.json
 briefs/
 memory_local/
+logs/
+runs/
+tools/__pycache__/
+api/__pycache__/
+
+# NOTE: latest_issue.* is NOT gitignored — GitHub Actions commits these files
+# back to the repo so Vercel can serve them at /latest. To exclude them locally
+# during development, use a local git config or .git/info/exclude.
