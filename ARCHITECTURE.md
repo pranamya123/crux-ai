@@ -73,42 +73,61 @@ Memory  Launches  Papers        Evaluator  Writer  Critic  Delivery
 
 Agents 2 and 3 run **concurrently** via a `ThreadPoolExecutor(max_workers=2)`. Agents 5 and 6 are in a **feedback loop**: rejection triggers a fresh write, up to 2 retries (3 total writer attempts).
 
-### 2 · Custom tools (handled by the orchestrator)
+### 2 · Custom tools (orchestrator-provided)
 
 ```python
-emit_event(session_id, event_type, data)            # write event row
-get_events(session_id, agent_name?, event_type?)    # read prior events
+emit_event(session_id, event_type, data)            # confirm event to JSONL, return event_id
+get_events(session_id, agent_name?, event_type?)    # read & filter JSONL events
 send_email_smtp(subject, body_markdown, recipients?) # SMTP delivery + side effect
 ```
 
-`send_email_smtp` has two side effects beyond the actual SMTP send:
+**How agents use these tools:**
+- **emit_event**: Agents call this after computing their output. The orchestrator appends the event to `/mnt/memory/session_{session_id}.jsonl` and returns confirmation.
+- **get_events**: Agents call this to read prior events (e.g., Evaluator reads `launches_researched` and `papers_researched` events from the Research agents). The orchestrator reads from the JSONL file and returns filtered results.
+- **send_email_smtp**: Delivery agent calls this to send the newsletter. The orchestrator handles SMTP authentication, per-recipient rendering, and persistence.
 
+**send_email_smtp side effects:**
 1. **Per-recipient rendering.** Each email is rendered separately so the footer can include `Unsubscribe`, with a personalised link `https://<APP_BASE_URL>/unsubscribe?email=<that recipient>`. TOC and back-to-top anchors are also rewritten to absolute `…/latest#item-N` URLs (Gmail strips in-document `id`s, breaking plain `#anchor` links).
 2. **Snapshot save.** Before sending, a non-personalised copy is rendered and written to `latest_issue.html` / `latest_issue.md` / `latest_issue_meta.json` so the public site's `/latest` endpoint can serve the most recent issue.
+3. **Credentials isolation.** SMTP credentials (username, password) are retrieved from Anthropic's credential vault, never exposed to the agent.
 
-### 3 · Shared session log (Supabase · `session_events`)
+### 3 · Shared session log (Anthropic Memory Stores · `/mnt/memory/`)
 
-```sql
-CREATE TABLE session_events (
-  id          BIGSERIAL    PRIMARY KEY,
-  session_id  TEXT         NOT NULL,
-  agent_name  TEXT         NOT NULL,
-  event_type  TEXT         NOT NULL,
-  data        JSONB        NOT NULL,
-  created_at  TIMESTAMPTZ  DEFAULT NOW()
-);
+Events are stored as append-only JSONL files in Anthropic's workspace-scoped Memory Stores:
+
+```
+/mnt/memory/
+├── session_{session_id}.jsonl        (per-run event log: agents append events)
+├── covered_topics.md                 (cross-session: topics covered in last 12 runs)
+└── latest_issue_meta.json            (snapshot: last newsletter subject, sent_at, recipients)
 ```
 
-Every agent's output is one row. Read the full run with one query:
-
-```sql
-SELECT agent_name, event_type, created_at
-FROM session_events
-WHERE session_id = 'newsletter_20260504_160649_80879d6e'
-ORDER BY created_at;
+**Event schema** (each line is a JSON object):
+```json
+{
+  "id": "uuid",
+  "session_id": "newsletter_YYYYMMDD_HHMMSS_8charhex",
+  "agent_name": "memory|research_launches|research_papers|evaluator|writer|critic|delivery",
+  "event_type": "covered_topics|launches_researched|papers_researched|items_evaluated|draft_written|critic_rejection|draft_approved|email_sent",
+  "data": { "...agent-specific payload..." },
+  "created_at": "2026-05-04T16:06:49.123456Z"
+}
 ```
 
-The same table is also how the **next week's** Memory Agent reads previous coverage — events are not session-scoped from the database's point of view.
+**Read the full run:**
+```bash
+cat /mnt/memory/session_newsletter_20260504_160649_80879d6e.jsonl | jq '.event_type'
+```
+
+**Cross-session memory:** The Memory Agent reads `/mnt/memory/covered_topics.md` to see what topics were covered in previous runs. No external database needed; persistence is workspace-scoped within Managed Agents.
+
+**Why Memory Stores over Supabase?**
+1. **Decoupling**: Session state lives in the platform, not external infrastructure.
+2. **Simplicity**: No schema management, no queries—just append-only JSONL files.
+3. **Workspace isolation**: Scoped to the workspace, secure by default.
+4. **Audit trail**: Each event is immutable; version history built-in.
+
+This aligns with Anthropic's "Scaling Managed Agents: Decoupling the brain from the hands" (Apr 2026).
 
 ### 4 · Public web layer (`app.py`, Vercel)
 

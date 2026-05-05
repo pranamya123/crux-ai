@@ -2,11 +2,14 @@
 """
 Multi-Agent Newsletter Orchestrator v2 - Shared Session Pattern.
 
-True "many brains, one session" pattern:
-- All 7 agents read/write to a SHARED session log (Supabase session_events table)
-- Each agent emits its work as events
+True "many brains, one session" pattern with Anthropic Memory Stores:
+- All 7 agents read/write to a SHARED session log (Anthropic Memory Stores at /mnt/memory/)
+- Each agent emits its work as events (JSONL format)
 - Subsequent agents read prior events via get_events()
 - Orchestrator handles custom tools: emit_event, get_events, send_email_smtp
+- Credentials (SMTP password) stored in Anthropic credential vault
+
+Inspired by "Scaling Managed Agents: Decoupling the brain from the hands" (Anthropic, Apr 2026)
 """
 import argparse
 import json
@@ -20,12 +23,13 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import anthropic
 from dotenv import load_dotenv
-from supabase import create_client, Client
 from email_renderer import render_brief_email_html
+from credentials import get_credential_manager
 
 load_dotenv(override=True)
 
@@ -45,39 +49,115 @@ AGENTS = {
 }
 
 # ============================================================================
-# SUPABASE CONNECTION (Shared Session Log)
+# MEMORY STORES (Shared Session Log - Anthropic Managed Agents)
 # ============================================================================
-SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL") or os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("ANON_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Agents write to /mnt/memory/session_{session_id}.jsonl (workspace-scoped, persistent)
+# This replaces the prior Supabase session_events table.
+# Note: Orchestrator running locally can read the JSONL files if they're copied locally,
+# or rely on agents returning event data via tool results.
+MEMORY_DIR = Path("/mnt/memory")
+LOCAL_MEMORY_DIR = Path(os.getenv("LOCAL_MEMORY_DIR", "./memory_local"))  # Local fallback for testing
 
 
 # ============================================================================
 # CUSTOM TOOL HANDLERS
 # ============================================================================
 def handle_emit_event(session_id: str, agent_name: str, event_type: str, data: dict) -> Dict[str, Any]:
+    """
+    Emit an event to the shared session log (Memory Stores JSONL).
+    Agents write directly to /mnt/memory/session_{session_id}.jsonl.
+    This handler confirms receipt and assigns an event_id.
+
+    In a production setup where the orchestrator runs as a Managed Agent itself,
+    the agent would write directly. For now, we support both:
+    - Agents write via bash: echo '{"event": ...}' >> /mnt/memory/session_{id}.jsonl
+    - Orchestrator writes on behalf: append to local memory JSONL file
+    """
     try:
-        result = supabase.table("session_events").insert({
+        event_id = str(uuid.uuid4())
+        event = {
+            "id": event_id,
             "session_id": session_id,
             "agent_name": agent_name,
             "event_type": event_type,
             "data": data,
-        }).execute()
-        return {"ok": True, "event_id": result.data[0]["id"]}
+            "created_at": datetime.utcnow().isoformat() + "Z",
+        }
+
+        # Try to write to /mnt/memory/ if it exists (running in Managed Agents environment)
+        # Otherwise, write to local directory for testing
+        try:
+            memory_file = MEMORY_DIR / f"session_{session_id}.jsonl"
+            if MEMORY_DIR.exists():
+                memory_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(memory_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(event) + "\n")
+                return {"ok": True, "event_id": event_id}
+        except (OSError, PermissionError):
+            pass
+
+        # Fallback: write to local memory directory
+        LOCAL_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        local_file = LOCAL_MEMORY_DIR / f"session_{session_id}.jsonl"
+        with open(local_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event) + "\n")
+        return {"ok": True, "event_id": event_id}
+
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
 def handle_get_events(session_id: str, agent_name: Optional[str] = None,
                        event_type: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Read events from the shared session log (Memory Stores JSONL).
+    Agents write directly to /mnt/memory/session_{session_id}.jsonl.
+    This handler reads and filters the JSONL file.
+
+    Args:
+        session_id: Required - filter to specific session
+        agent_name: Optional - filter by agent name
+        event_type: Optional - filter by event type
+
+    Returns: {"ok": True, "events": [sorted by created_at]} or error dict
+    """
     try:
-        query = supabase.table("session_events").select("*").eq("session_id", session_id)
-        if agent_name:
-            query = query.eq("agent_name", agent_name)
-        if event_type:
-            query = query.eq("event_type", event_type)
-        result = query.order("created_at").execute()
-        return {"ok": True, "events": result.data}
+        events = []
+
+        # Try to read from /mnt/memory/ if it exists (Managed Agents environment)
+        # Otherwise, read from local directory
+        memory_file = None
+        if MEMORY_DIR.exists():
+            memory_file = MEMORY_DIR / f"session_{session_id}.jsonl"
+        if memory_file is None or not memory_file.exists():
+            memory_file = LOCAL_MEMORY_DIR / f"session_{session_id}.jsonl"
+
+        if not memory_file.exists():
+            return {"ok": True, "events": []}
+
+        # Read JSONL file and filter
+        with open(memory_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                    # Apply filters
+                    if event.get("session_id") != session_id:
+                        continue
+                    if agent_name and event.get("agent_name") != agent_name:
+                        continue
+                    if event_type and event.get("event_type") != event_type:
+                        continue
+                    events.append(event)
+                except json.JSONDecodeError:
+                    # Skip malformed lines
+                    continue
+
+        # Sort by created_at (JSONL order is append-only, should already be sorted)
+        events.sort(key=lambda e: e.get("created_at", ""))
+        return {"ok": True, "events": events}
+
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -101,14 +181,22 @@ def _save_latest_issue(subject: str, body_markdown: str, body_html_public: str) 
 
 
 def handle_send_email_smtp(args: dict) -> Dict[str, Any]:
-    host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    """
+    Send email via SMTP with credentials from Anthropic credential vault or env.
+    Renders per-recipient HTML and saves snapshot for /latest endpoint.
+    """
+    # Retrieve credentials with fallback chain (vault → env vars → defaults)
+    cred_mgr = get_credential_manager()
     try:
-        port = int(os.environ.get("SMTP_PORT", "587"))
-    except ValueError:
-        return {"ok": False, "error": "SMTP_PORT must be an integer"}
-    user = os.environ.get("SMTP_USER")
-    password = os.environ.get("SMTP_PASSWORD")
-    from_addr = os.environ.get("SMTP_FROM", user or "")
+        creds = cred_mgr.get_smtp_credentials()
+        host = creds["host"]
+        port = int(creds["port"])
+        user = creds["user"]
+        password = creds["password"]
+        from_addr = creds.get("from_addr") or user
+    except (ValueError, TypeError) as e:
+        return {"ok": False, "error": f"SMTP credential error: {e}"}
+
     recipients_env = os.environ.get("RECIPIENT_EMAILS", "")
     base_url = os.environ.get("APP_BASE_URL", "http://localhost:5000")
 
@@ -500,7 +588,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         dest="session_id",
         default=None,
         help="Resume an existing newsletter session by id (e.g. newsletter_20260504_160649_80879d6e). "
-             "Reads session_events from Supabase and skips any step whose terminal event is already present.",
+             "Reads session_events from Memory Stores (/mnt/memory/session_{id}.jsonl) and skips any step whose terminal event is already present.",
     )
     return parser.parse_args(argv)
 

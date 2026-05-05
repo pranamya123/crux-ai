@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "env": {
+    "ANTHROPIC_API_KEY": "@anthropic_api_key",
+    "SMTP_USER": "@smtp_user",
+    "SMTP_PASSWORD": "@smtp_password",
+    "SMTP_HOST": {
+      "default": "smtp.gmail.com"
+    },
+    "SMTP_PORT": {
+      "default": "587"
+    },
+    "SMTP_FROM": "@smtp_from",
+    "RECIPIENT_EMAILS": "@recipient_emails",
+    "APP_BASE_URL": "@app_base_url"
+  },
+  "crons": [
+    {
+      "path": "/api/orchestrate",
+      "schedule": "0 9 * * 4"
+    }
+  ]
+}

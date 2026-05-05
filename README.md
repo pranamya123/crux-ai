@@ -36,16 +36,17 @@ Required env vars:
 
 ```
 ANTHROPIC_API_KEY=...
-SUPABASE_URL=...                  # or NEXT_PUBLIC_SUPABASE_URL
-SUPABASE_ANON_KEY=...             # or ANON_KEY
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=...
-SMTP_PASSWORD=...                 # Gmail app password
+SMTP_PASSWORD=...                 # Gmail app password (or retrieve from Anthropic vault)
 SMTP_FROM=...                     # defaults to SMTP_USER
 RECIPIENT_EMAILS=a@x.com,b@y.com
 APP_BASE_URL=https://your-vercel-deployment.vercel.app
+LOCAL_MEMORY_DIR=./memory_local   # (optional) for local testing; uses /mnt/memory in Managed Agents
 ```
+
+Note: Session state is persisted in **Anthropic Memory Stores** (`/mnt/memory/` in Managed Agents environment), not Supabase. Credentials (SMTP password) should be stored in Anthropic's credential vault for production.
 
 ## Run
 
