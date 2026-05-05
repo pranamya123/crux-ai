@@ -331,10 +331,14 @@ class OrchestratorV2:
         print("\n>>> Running Research agents in parallel...", flush=True)
         with ThreadPoolExecutor(max_workers=2) as executor:
             f_l = executor.submit(self.runner.run, AGENTS["research_launches"], "research_launches",
-                "Find AI launches from past 7 days. Emit launches_researched event."
+                "Find 5-7 significant AI ecosystem developments from past 7 days "
+                "(models, products, infra, hardware, $100M+ funding, big-tech AI moves). "
+                "Emit launches_researched event."
             )
             f_p = executor.submit(self.runner.run, AGENTS["research_papers"], "research_papers",
-                "Find AI research findings from past 7 days. Emit papers_researched event."
+                "Find 2-3 AI research findings from past 7 days that a working engineer or PM "
+                "can act on (eval, prompting, agents, reliability, safety, efficiency, rag, finetune). "
+                "Emit papers_researched event."
             )
             return f_l.result(), f_p.result()
 
