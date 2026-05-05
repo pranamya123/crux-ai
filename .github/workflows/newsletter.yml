@@ -44,6 +44,9 @@ jobs:
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
           APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+          # Supabase: orchestrator fetches subscriber list from 'subscribers' table
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
           if [ -n "${{ inputs.session_id }}" ]; then
             echo "Resuming session: ${{ inputs.session_id }}"

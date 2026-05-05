@@ -40,11 +40,19 @@ Add these secrets:
 | `ANTHROPIC_API_KEY` | Your Anthropic API key | ✅ Yes |
 | `SMTP_USER` | Gmail address | ✅ Yes |
 | `SMTP_PASSWORD` | Gmail App Password | ✅ Yes |
-| `RECIPIENT_EMAILS` | `email1@x.com,email2@y.com` | ✅ Yes |
 | `APP_BASE_URL` | `https://your-domain.vercel.app` | ✅ Yes |
+| `SUPABASE_URL` | Your Supabase project URL | ✅ Yes — auto-fetches subscribers |
+| `SUPABASE_ANON_KEY` | Supabase anon key | ✅ Yes — auto-fetches subscribers |
+| `RECIPIENT_EMAILS` | `email1@x.com,email2@y.com` | ❌ Fallback only (used if Supabase fails) |
 | `SMTP_HOST` | `smtp.gmail.com` (default) | ❌ No |
 | `SMTP_PORT` | `587` (default) | ❌ No |
 | `SMTP_FROM` | Sender (defaults to SMTP_USER) | ❌ No |
+
+**Subscriber List Source:**
+- ✅ **Primary:** Supabase `subscribers` table (auto-fetched on every run)
+- 🔄 **Fallback:** `RECIPIENT_EMAILS` env var (only if Supabase unavailable)
+
+This means subscribe/unsubscribe via the website automatically takes effect on the next Thursday's send. **No manual env var updates needed.**
 
 ### Gmail App Password:
 1. Enable 2FA: https://myaccount.google.com/security

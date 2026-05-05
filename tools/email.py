@@ -21,6 +21,7 @@ from typing import Any, Dict, List
 from credentials import get_credential_manager
 from email_renderer import render_brief_email_html
 from retry import retry_with_backoff
+from tools.subscribers import get_subscribers
 
 
 def _save_latest_issue(subject: str, body_markdown: str, body_html_public: str) -> None:
@@ -68,17 +69,18 @@ def handle_send_email_smtp(args: dict) -> Dict[str, Any]:
     except (ValueError, TypeError) as e:
         return {"ok": False, "error": f"SMTP credential error: {e}"}
 
-    recipients_env = os.environ.get("RECIPIENT_EMAILS", "")
     base_url = os.environ.get("APP_BASE_URL", "http://localhost:5000")
 
     if not user or not password:
         return {"ok": False, "error": "SMTP_USER or SMTP_PASSWORD not set"}
 
-    recipients = args.get("recipients") or [
-        r.strip() for r in recipients_env.split(",") if r.strip()
-    ]
+    # Resolve recipients with priority:
+    # 1. Explicit args.recipients (if provided by agent)
+    # 2. Supabase 'subscribers' table (live source of truth)
+    # 3. RECIPIENT_EMAILS env var (fallback)
+    recipients = args.get("recipients") or get_subscribers()
     if not recipients:
-        return {"ok": False, "error": "No recipients"}
+        return {"ok": False, "error": "No recipients (Supabase + env fallback both empty)"}
 
     subject = args["subject"]
     body_markdown = args["body_markdown"]
