@@ -40,6 +40,7 @@ from tools.memory_store import (
     count_events,
 )
 from tools.email import handle_send_email_smtp
+from tools.verifier import handle_verify_links
 
 load_dotenv(override=True)
 
@@ -55,18 +56,20 @@ AGENTS = {
     "evaluator": "agent_011CahybXQjvG9FEzNch8iqh",
     "writer": "agent_011CahyeAHLRe13m3nZ2jSSz",
     "critic": "agent_011CahyewGmj313dgDipAwxw",
+    "verifier": "agent_011CakPwT4eodJzVGduhySgq",
     "delivery": "agent_011CahyfZR9qeUvsHuMFS2Co",
 }
 
 # Steps in order. Each step has terminal event(s) that mark completion.
 # Used by step-based orchestration (one Vercel function per step).
-STEP_ORDER = ["memory", "research", "evaluate", "write_critique", "deliver"]
+STEP_ORDER = ["memory", "research", "evaluate", "write_critique", "verify", "deliver"]
 
 STEP_TERMINAL_EVENTS = {
     "memory": ["covered_topics"],
     "research": ["launches_researched", "papers_researched"],
     "evaluate": ["items_evaluated"],
     "write_critique": ["draft_approved"],
+    "verify": ["verification_passed"],
     "deliver": ["email_sent"],
 }
 
@@ -78,6 +81,7 @@ AGENT_CRITICALITY = {
     "evaluator": "critical",
     "writer": "critical",
     "critic": "critical",
+    "verifier": "critical",  # Must pass before delivery — catches hallucinated URLs
     "delivery": "critical",
 }
 
@@ -89,8 +93,12 @@ AGENT_TIMEOUTS = {
     "evaluator": 180,
     "writer": 300,
     "critic": 180,
+    "verifier": 120,  # Mostly HTTP HEAD requests; should be fast
     "delivery": 120,
 }
+
+# Max times the Verifier can fail before we abort (Writer fixes URLs each retry).
+MAX_VERIFICATION_RETRIES = 2
 
 
 # ============================================================================
@@ -135,6 +143,8 @@ class AgentRunner:
                 )
             elif tool_name == "send_email_smtp":
                 result = handle_send_email_smtp(tool_input)
+            elif tool_name == "verify_links":
+                result = handle_verify_links(tool_input)
             else:
                 result = {"ok": False, "error": f"Unknown tool: {tool_name}"}
         except Exception as e:
@@ -384,6 +394,13 @@ class OrchestratorV2:
             "Read draft_written event, review quality, emit draft_approved or critic_rejection event."
         )
 
+    def step_verify(self):
+        return self.runner.run(
+            AGENTS["verifier"], "verifier",
+            "Read the latest draft_approved event. Call verify_links on the brief content. "
+            "Emit verification_passed if all_valid; otherwise emit verification_failed with the invalid URLs."
+        )
+
     def step_deliver(self):
         return self.runner.run(
             AGENTS["delivery"], "delivery",
@@ -457,6 +474,9 @@ class OrchestratorV2:
             elif step_name == "write_critique":
                 results.update(self._run_write_critique_loop())
 
+            elif step_name == "verify":
+                results.update(self._run_verify_loop())
+
             elif step_name == "deliver":
                 results["delivery"] = self.step_deliver()
 
@@ -527,6 +547,44 @@ class OrchestratorV2:
 
         return results
 
+    def _run_verify_loop(self) -> Dict[str, Any]:
+        """
+        Run Verifier; if it fails, loop back to Writer (which will re-emit a draft;
+        Critic re-approves; Verifier re-checks). Bounded by MAX_VERIFICATION_RETRIES.
+        """
+        results = {}
+
+        if self._has_event("verification_passed"):
+            return {"already_verified": True}
+
+        verify_attempts = 0
+        while verify_attempts <= MAX_VERIFICATION_RETRIES:
+            verify_attempts += 1
+            self.logger.info(f"verifier_attempt_{verify_attempts}", attempt=verify_attempts)
+            results[f"verifier_v{verify_attempts}"] = self.step_verify()
+
+            if self._has_event("verification_passed"):
+                self.logger.info("verification_passed", attempt=verify_attempts)
+                return results
+
+            if not self._has_event("verification_failed"):
+                # Verifier did not emit anything terminal — treat as a soft fail and stop
+                self.logger.warn("verifier_no_terminal_event", attempt=verify_attempts)
+                break
+
+            if verify_attempts > MAX_VERIFICATION_RETRIES:
+                self.logger.warn("max_verification_retries_reached", attempts=verify_attempts)
+                break
+
+            # Verification failed — loop back through Writer/Critic to fix URLs
+            self.logger.info(
+                "verification_failed_looping_back_to_writer",
+                attempt=verify_attempts,
+            )
+            results.update(self._run_write_critique_loop())
+
+        return results
+
     # ========================================================================
     # FULL PIPELINE (for local/long-running execution)
     # ========================================================================
@@ -585,7 +643,19 @@ class OrchestratorV2:
             self._finalize(results, success=False)
             return
 
-        # Step 5: Delivery
+        # Step 5: Verify (URL & arXiv hallucination check)
+        if self._has_event("verification_passed"):
+            self.logger.info("step_skipped: verify")
+        else:
+            results.update(self._run_verify_loop())
+
+        if not self._has_event("verification_passed"):
+            self.logger.error("verification_did_not_pass")
+            print("\n>>> Verification did not pass. Stopping before delivery.", flush=True)
+            self._finalize(results, success=False)
+            return
+
+        # Step 6: Delivery
         if self._has_event("email_sent"):
             self.logger.info("step_skipped: delivery")
         else:

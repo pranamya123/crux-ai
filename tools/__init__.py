@@ -15,10 +15,12 @@ Tools:
 from tools.memory_store import handle_emit_event, handle_get_events
 from tools.email import handle_send_email_smtp
 from tools.subscribers import get_subscribers
+from tools.verifier import handle_verify_links
 
 __all__ = [
     "handle_emit_event",
     "handle_get_events",
     "handle_send_email_smtp",
     "get_subscribers",
+    "handle_verify_links",
 ]
