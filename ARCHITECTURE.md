@@ -3,13 +3,13 @@
 **Document type:** Technical architecture
 **Audience:** Engineers, technical reviewers, architecture interviewers
 **Status:** Production
-**Last updated:** May 2026
+**Last updated:** May 2026 (post-Verifier agent integration)
 
 ---
 
 ## 0. Executive Summary
 
-AI Weekly is an autonomous newsletter system that ships one issue every Thursday, written end-to-end by **seven specialized Anthropic Managed Agents** coordinating through a shared event log. The system aligns with the patterns described in Anthropic's *"Scaling Managed Agents: Decoupling the brain from the hands"* (April 2026) — agents (brains), tools (hands), and session state are independent abstractions that can fail, retry, or be replaced without disturbing each other.
+AI Weekly is an autonomous newsletter system that ships one issue every Thursday, written end-to-end by **eight specialized Anthropic Managed Agents** coordinating through a shared event log. The system aligns with the patterns described in Anthropic's *"Scaling Managed Agents: Decoupling the brain from the hands"* (April 2026) — agents (brains), tools (hands), and session state are independent abstractions that can fail, retry, or be replaced without disturbing each other.
 
 **Key design choices:**
 
@@ -18,6 +18,8 @@ AI Weekly is an autonomous newsletter system that ships one issue every Thursday
 | **Multi-agent specialization** over single big-prompt | Each agent has one job, one quality bar, one criticality class. Easier to debug, swap, and reason about. |
 | **Event-sourced session log** (Memory Stores JSONL) | Durable shared state. Resume-from-crash for free. Natural audit trail. |
 | **Per-tool modules** (`tools/email.py`, etc.) | Independent failure boundaries. Each tool has its own retry/backoff. "Many hands" pattern. |
+| **Hallucination grounding via Verifier agent** | Every URL and arXiv citation in the approved draft is checked against reality before delivery. Catches fabricated links before they reach subscribers. |
+| **Citation enforcement in Writer + Critic** | Every factual claim must include a Markdown link. Critic rejects drafts that lack citations. Combined with the Verifier, this hardens output trust. |
 | **GitHub Actions** as the orchestration runtime | Vercel Hobby has a 60s function cap; pipelines run 5–15 min. GitHub Actions gives 6 hours, free, no cold starts. |
 | **Vercel** as the web layer only | Subscribe form, `/latest`, `/admin`, `/unsubscribe`. Auto-deploys on every push. |
 | **Supabase** as the subscriber registry | Live source of truth. Orchestrator queries it on every run, so subscribe/unsubscribe takes effect immediately. |
@@ -27,7 +29,7 @@ AI Weekly is an autonomous newsletter system that ships one issue every Thursday
 - ~$2 per run (occasional spikes to $4 on Critic retries)
 - ~10 minutes wall-clock per run
 - Zero touch ops: subscribe → live; orchestrator → autonomous
-- 7 agents × 1 shared session × 5 logical steps × 3 custom tools
+- 8 agents × 1 shared session × 6 logical steps × 4 custom tools
 
 ---
 
@@ -38,9 +40,10 @@ AI Weekly is an autonomous newsletter system that ships one issue every Thursday
 The project's primary goal is **education through production**: build a real, end-to-end system on Anthropic Managed Agents to internalize the patterns that matter (and form opinions on which patterns don't).
 
 A weekly AI newsletter was chosen because it exercises every interesting capability:
-- **Multi-stage pipeline** (research → evaluate → write → critique → deliver) — true multi-agent
+- **Multi-stage pipeline** (research → evaluate → write → critique → verify → deliver) — true multi-agent
 - **Long-horizon execution** (10+ minutes, multi-step, asynchronous)
 - **Quality gates** (a Critic agent that can reject the Writer's draft)
+- **Hallucination grounding** (a Verifier agent that confirms every URL and arXiv citation actually exists before delivery)
 - **Cross-session memory** (Memory Agent reads what was covered last week)
 - **External integrations** (SMTP, web research, subscriber DB)
 - **Cost sensitivity** (every run costs real money — forces good engineering)
@@ -142,8 +145,8 @@ We do not silently retry forever. We do not silently swallow errors. We do not r
    │  OrchestratorV2 (host process; stateless)                     │
    │  ──────────────────────────────────────────────────────────   │
    │  • Generates / resumes shared_session_id                      │
-   │  • Drives 5 logical steps in sequence (parallel where useful) │
-   │  • Routes 3 custom tool types to handler modules              │
+   │  • Drives 6 logical steps in sequence (parallel where useful) │
+   │  • Routes 4 custom tool types to handler modules              │
    │  • Maintains StructuredLogger + RunTracker (observability)    │
    │  • Persists run summary to runs/{session_id}.json             │
    └─────────────────────────────────────────────┬─────────────────┘
@@ -151,7 +154,7 @@ We do not silently retry forever. We do not silently swallow errors. We do not r
    ┌──────────────────────────────────┐          │ creates fresh session
    │  Anthropic Managed Agents        │ ◄────────┘ per agent (cattle)
    │  ─────────────────────────────   │
-   │  7 specialized agents            │
+   │  8 specialized agents            │
    │  Each: model + system prompt +   │
    │  tool config + criticality       │
    └────────────┬─────────────────────┘
@@ -166,6 +169,8 @@ We do not silently retry forever. We do not silently swallow errors. We do not r
    │    send_email_smtp               │    │  (append-only event  │
    │  tools/subscribers.py     ──────►│    │   sourcing log)      │
    │    get_subscribers (Supabase)    │    └──────────────────────┘
+   │  tools/verifier.py        ──────►│                            
+   │    verify_links (HEAD + arXiv)   │                            
    └────────────┬─────────────────────┘
                 │
                 ├─► SMTP (Gmail) ──► subscriber inboxes
@@ -192,7 +197,7 @@ We do not silently retry forever. We do not silently swallow errors. We do not r
 
 ## 4. Component Deep Dive
 
-### 4.1 The seven agents (brains)
+### 4.1 The eight agents (brains)
 
 Each agent is configured in the Claude Console with a model assignment, system prompt, and tool list. The Console is the source of truth for prompts; this repo references them by `agent_id`.
 
@@ -202,9 +207,10 @@ Each agent is configured in the Claude Console with a model assignment, system p
 | 2 | **Research Launches** | Opus 4.7 | Find AI ecosystem developments past 7 days | `launches_researched` | `covered_topics` | Critical |
 | 3 | **Research Papers** | Opus 4.7 | Find actionable AI research past 7 days | `papers_researched` | `covered_topics` | Optional |
 | 4 | **Evaluator** | Opus 4.7 | Score & rank with transparent rubric (relevance/depth/novelty 1–10 each) | `items_evaluated` | research events | Critical |
-| 5 | **Writer** | Opus 4.7 | Draft the brief in markdown | `draft_written` | `items_evaluated` + (on retry) `critic_rejection` | Critical |
-| 6 | **Critic** | Opus 4.7 | Review for quality, banned-words, style | `draft_approved` or `critic_rejection` | latest `draft_written` | Critical |
-| 7 | **Delivery** | Haiku 4.5 | Render & send via SMTP | `email_sent` | `draft_approved` | Critical |
+| 5 | **Writer** | Opus 4.7 | Draft the brief in markdown with mandatory citations on every claim | `draft_written` | `items_evaluated` + (on retry) `critic_rejection` or `verification_failed` | Critical |
+| 6 | **Critic** | Opus 4.7 | Review for quality, banned-words, style, and citation presence | `draft_approved` or `critic_rejection` | latest `draft_written` | Critical |
+| 7 | **Verifier** | Haiku 4.5 | Verify every URL and arXiv citation in the approved draft actually exists | `verification_passed` or `verification_failed` | latest `draft_approved` | Critical |
+| 8 | **Delivery** | Haiku 4.5 | Render & send via SMTP | `email_sent` | `draft_approved` + `verification_passed` | Critical |
 
 **Model tiering rationale:**
 - **Opus 4.7** for cognitive work that materially affects output quality (research judgment, evaluation, writing, critique).
@@ -236,7 +242,7 @@ Max 2 rejections (3 total Writer attempts). If the Critic rejects the third draf
 
 1. Generates or resumes a `shared_session_id`.
 2. Initializes a `StructuredLogger` and `RunTracker` for observability.
-3. Drives the five logical steps (`memory`, `research`, `evaluate`, `write_critique`, `deliver`) sequentially.
+3. Drives the six logical steps (`memory`, `research`, `evaluate`, `write_critique`, `verify`, `deliver`) sequentially.
 4. For each step, checks the session log for terminal events; **skips already-completed steps** (resume support).
 5. Spawns a fresh Managed Agents session per agent run.
 6. Streams events from each session, routing `custom_tool_use` events to the appropriate `tools/` module.
@@ -299,7 +305,9 @@ The trade-off: no native indexes. With ~30 events per run, this is not a problem
 | `items_evaluated` | Evaluator | Ranked/filtered set with scoring breakdown |
 | `draft_written` | Writer | A complete brief in markdown |
 | `critic_rejection` | Critic | Specific issues that must be addressed |
-| `draft_approved` | Critic | Brief is ready for delivery |
+| `draft_approved` | Critic | Brief passed quality + citation checks |
+| `verification_passed` | Verifier | All URLs and arXiv citations confirmed to exist |
+| `verification_failed` | Verifier | One or more URLs were unreachable or fabricated |
 | `email_sent` | Delivery | Issue went out; pipeline complete |
 
 The orchestrator's resume logic depends only on the **terminal event** of each step (e.g., `draft_approved`, `email_sent`). It does not care how many drafts or rejections preceded approval — those exist in the log for debugging.
@@ -311,9 +319,10 @@ Each tool is its own module under `tools/`. This is the "many hands" pattern —
 ```
 tools/
 ├── __init__.py          # exports
-├── memory_store.py      # emit_event, get_events  — session log access
+├── memory_store.py      # emit_event, get_events    — session log access
 ├── email.py             # send_email_smtp           — SMTP delivery
-└── subscribers.py       # get_subscribers           — Supabase fetch
+├── subscribers.py       # get_subscribers           — Supabase fetch
+└── verifier.py          # verify_links              — URL + arXiv existence check
 ```
 
 **`tools/memory_store.py`:**
@@ -335,6 +344,15 @@ tools/
   1. Supabase `subscribers` table (live source of truth)
   2. `RECIPIENT_EMAILS` env var (fallback if Supabase unreachable)
 - This means subscribe/unsubscribe via the website takes effect on the **next run**, with no manual env var update.
+
+**`tools/verifier.py`:**
+- `verify_links(args)` — extracts every Markdown link from a document and checks each URL exists
+- Two verification paths:
+  1. Standard URLs: HTTP `HEAD` request with `GET` fallback for servers that reject HEAD (5xx → fail; 405 → fall through to GET)
+  2. arXiv URLs: queries the arXiv API directly to confirm the paper ID actually exists rather than just that the URL responds
+- Returns structured result: `{all_valid, checked, valid: [...], invalid: [{url, reason}]}`
+- Wrapped in `@retry_with_backoff(max_attempts=2, initial_delay=1.0)` — slow networks need a second pass
+- Cost: roughly two cents per run; mostly HTTP, no LLM tokens
 
 **Why one module per tool:**
 
@@ -489,6 +507,31 @@ This unblocks the Evaluator (which depends on the terminal event existing), pres
 **Why we don't have a global "alert on failure" yet:**
 GitHub Actions emails the workflow owner on job failure. That's the alert. We have not added Slack/PagerDuty because the system runs once a week and the GitHub email is sufficient.
 
+### 4.9 Hallucination grounding (Verifier loop)
+
+The risk that a Critic-approved draft could still contain a fabricated URL or a non-existent arXiv paper is real and high-impact: a single hallucinated citation in a research newsletter destroys reader trust permanently. The Critic catches a lot of bad writing but cannot verify factual claims against external reality. The Verifier closes that gap.
+
+The flow looks like this:
+
+1. The Critic approves a draft (`draft_approved` event emitted).
+2. The orchestrator runs the **Verifier** agent.
+3. The Verifier reads the latest `draft_approved` event and calls `verify_links` on the brief content.
+4. `verify_links` extracts every Markdown link, runs HEAD requests on each URL, and queries the arXiv API for any arXiv IDs it finds.
+5. The Verifier emits one of two terminal events:
+   - `verification_passed` — every URL and citation resolved successfully; the Delivery agent runs.
+   - `verification_failed` — one or more URLs are unreachable; the orchestrator loops back to the Writer with the list of bad URLs.
+6. On a `verification_failed` event, the Writer reads the `invalid_urls` array and either replaces each bad URL with a valid one from the `items_evaluated` event or rewrites the surrounding sentence to remove the citation entirely. The Critic then re-approves; the Verifier re-checks.
+
+**Bounded retry:** Up to two verification failures are tolerated (`MAX_VERIFICATION_RETRIES = 2`). Beyond that, the orchestrator aborts the run before delivery — better to skip a week than ship a verified-fabricated issue.
+
+**Citation enforcement complements this defense.** The Writer's system prompt requires every factual claim to include a Markdown link, and the Critic explicitly rejects drafts that lack citations. Together, the prompt-level requirement and the runtime check form a two-layer defense against hallucinated facts: the Critic ensures citations exist, the Verifier ensures the citations resolve.
+
+**Why a separate agent rather than a tool the Critic calls:**
+- The Verifier has a different criticality and timeout profile than the Critic (mechanical work, faster timeout).
+- It runs on Haiku rather than Opus since the work is deterministic.
+- Keeping it a separate agent means the Critic's prompt doesn't need to know about HTTP semantics or arXiv API behavior.
+- The verification step is now a first-class part of the pipeline state machine, with its own terminal events and resume support.
+
 ---
 
 ## 5. End-to-End Data Flow
@@ -521,14 +564,22 @@ T+4:30    Step 3: EVALUATOR (Opus, ~2 min)
           • emit_event("items_evaluated", { selected_launches, selected_papers, rejected_items, summary })
 
 T+6:30    Step 4: WRITER ↔ CRITIC LOOP (Opus × N, ~3–6 min)
-          • Writer: get_events("items_evaluated") → draft → emit_event("draft_written")
-          • Critic: get_events("draft_written") → review →
+          • Writer: get_events("items_evaluated") → draft with mandatory citations →
+                    emit_event("draft_written")
+          • Critic: get_events("draft_written") → review (quality + citations present) →
               ◦ If approved: emit_event("draft_approved")
               ◦ If rejected: emit_event("critic_rejection") → loop back to Writer
           (max 2 rejections; 3 total Writer attempts)
 
-T+10:30   Step 5: DELIVERY (Haiku, ~1 min)
-          • get_events("draft_approved") → final markdown
+T+10:30   Step 5: VERIFY (Haiku, ~30s)
+          • Verifier: get_events("draft_approved") → call verify_links on brief →
+              ◦ All URLs resolve + arXiv IDs valid: emit_event("verification_passed")
+              ◦ One or more invalid: emit_event("verification_failed") with bad URLs →
+                loop back to Writer (Writer fixes URLs, Critic re-approves, Verifier re-checks)
+          (max 2 verification failures before abort)
+
+T+11:00   Step 6: DELIVERY (Haiku, ~1 min)
+          • get_events("draft_approved") + verification_passed exists → final markdown
           • Calls send_email_smtp:
               ◦ tools/subscribers.get_subscribers() → live list from Supabase
               ◦ tools/email.handle_send_email_smtp(subject, markdown):
@@ -537,16 +588,16 @@ T+10:30   Step 5: DELIVERY (Haiku, ~1 min)
                   - SMTP send to all subscribers
           • emit_event("email_sent", { recipients, subject })
 
-T+11:30   Orchestrator finalizes:
+T+12:00   Orchestrator finalizes:
           • RunTracker.persist() → writes runs/{session_id}.json
           • briefs/{session_id}_log.json written (compact view of run)
 
-T+11:35   GitHub Actions workflow:
+T+12:05   GitHub Actions workflow:
           • Commits latest_issue.{html,md,json} to repo
           • Uploads logs/, runs/, briefs/ as workflow artifacts (30-day retention)
           • Pushes to main
 
-T+12:00   Vercel auto-deploys the new commit
+T+12:30   Vercel auto-deploys the new commit
           • /latest now serves the new issue
           • Subscribers see new edition in their inbox
 ```
@@ -561,10 +612,13 @@ T+12:00   Vercel auto-deploys the new commit
 | Agent silently exits without emitting | Post-condition check after step | Auto-insert placeholder event; pipeline continues |
 | Agent exceeds per-agent timeout | AgentRunner timer breaks stream | Marked failed; criticality decides if pipeline aborts |
 | Critic rejects 3 times | Loop counter hits max_retries | Pipeline aborts before delivery; week is skipped |
+| Verifier reports invalid URLs | `verification_failed` event | Loop back to Writer with bad URLs; Critic re-approves; Verifier re-checks (max 2 retries) |
+| Verifier exceeds 2 retries (URLs still bad) | `MAX_VERIFICATION_RETRIES` exhausted | Pipeline aborts before delivery; week is skipped |
 | GitHub Actions runner killed mid-run | Workflow shows failure | Re-trigger with `--session-id <id>` resumes from last terminal event |
 | SMTP server transient failure | `tools/email.py` retry decorator | 2 attempts with 2s/4s backoff |
 | Supabase unreachable for subscriber fetch | `tools/subscribers.py` returns None | Falls back to `RECIPIENT_EMAILS` env var |
 | Memory Stores write failure | `emit_event` returns `{ok: false}` | Tool-level retry; if persistent, agent receives error and decides |
+| Slow target server during link verification | `verify_links` HEAD timeout | Falls back to GET; if both fail, URL marked invalid |
 | Vercel deploy fails after commit | Vercel dashboard shows red | Manual rollback; orchestrator already sent emails — only `/latest` page is stale |
 | `latest_issue.html` git push conflict | Workflow exits nonzero | Re-run workflow; idempotent commit |
 
@@ -603,10 +657,12 @@ This is a small, public-facing system. We did not over-engineer security, but we
 - Evaluator: 95s
 - Writer (single attempt): 110s
 - Critic (single review): 75s
+- Verifier: 30s (HTTP HEAD requests + arXiv API)
 - Delivery: 35s
 - Orchestrator overhead: ~10s
-- **Total: ~8 minutes** (no Critic retries)
+- **Total: ~8.5 minutes** (no Critic or Verifier retries)
 - **With one Critic retry: ~12 minutes**
+- **With one Verifier retry (Writer fixes URLs, Critic re-approves, Verifier re-checks): ~14 minutes**
 
 **Per-run cost (observed range, USD):**
 - Lowest observed: $0.77 (heavy cache hits, single Critic pass)
@@ -619,7 +675,8 @@ This is a small, public-facing system. We did not over-engineer security, but we
 - Research Opus calls (~25% combined)
 - Evaluator Opus (~20%)
 - Critic Opus (~15%)
-- Haiku agents (~10% combined)
+- Haiku agents combined: Memory + Verifier + Delivery (~10%)
+- Verifier specifically: ~$0.02/run — almost entirely HTTP, no LLM tokens beyond reading the draft
 
 **Operational cost (monthly, 4 runs):**
 - Anthropic API: $8–$32
@@ -643,6 +700,10 @@ Brief notes on choices that warrant justification.
 | Per-tool modules under `tools/` | One `tool_handlers.py` file | Independent failure boundaries; per-tool retry policies |
 | State-driven Writer/Critic loop | Counter-driven | Counts of `draft_written` vs `critic_rejection` give correct resume behavior automatically |
 | Auto-insert placeholder on silent agent failure | Hard-fail; Manual restart | Optional agents shouldn't kill the run; failure stays visible in the log |
+| Verifier as a separate agent (not a Critic tool) | Add `verify_links` to Critic's toolset | Different criticality, timeout, and model tier; keeps Critic's prompt focused on quality, not HTTP semantics |
+| Citation enforcement at prompt + Critic check | Just hope the Writer cites things | Two-layer defense: Writer must include links by prompt; Critic rejects drafts that don't. Pairs with Verifier for full trust hardening. |
+| Verifier on Haiku, not Opus | All-Opus | Verification is mechanical (read draft, call HTTP); no judgment needed. Cuts cost to ~$0.02/run |
+| Bounded verification retries (`MAX_VERIFICATION_RETRIES = 2`) | Unlimited retries | If URLs keep failing, the source data is broken; better to skip a week than ship a verified-fabricated issue |
 | Opus for cognitive agents, Haiku for mechanical | All-Opus; All-Haiku | Tiering cuts ~40% of cost with no observable quality loss on Haiku-assigned tasks |
 | Supabase as live subscriber source | Static `RECIPIENT_EMAILS` env | Avoids weekly manual env-var updates after subscribe/unsubscribe |
 | Commit `latest_issue.html` to repo | Object storage (S3); database blob | Free; auditable; rolls back via git revert |
@@ -704,7 +765,7 @@ Concrete next moves we have considered but not yet built:
 
 | Path | Purpose |
 |------|---------|
-| `orchestrator_v2.py` | Step-based orchestrator + AgentRunner with retry/timeout/observability |
+| `orchestrator_v2.py` | Step-based orchestrator + AgentRunner with retry/timeout/observability + Verifier loop |
 | `observability.py` | StructuredLogger, RunTracker, run-history readers |
 | `retry.py` | Exponential backoff decorator + Anthropic transient-error classifier |
 | `credentials.py` | Credential resolution chain (env → vault placeholder) |
@@ -712,6 +773,7 @@ Concrete next moves we have considered but not yet built:
 | `tools/memory_store.py` | `emit_event`, `get_events` (session log) |
 | `tools/email.py` | `send_email_smtp` (SMTP + per-recipient render + snapshot) |
 | `tools/subscribers.py` | `get_subscribers` (Supabase live fetch + env fallback) |
+| `tools/verifier.py` | `verify_links` (HTTP HEAD + arXiv API for hallucination grounding) |
 | `email_renderer.py` | Editorial HTML rendering (per-recipient unsubscribe + Gmail-safe TOC) |
 | `app.py` | Flask web app: subscribe / unsubscribe / latest / admin |
 | `index.py` | Vercel Python runtime entrypoint (`from app import app`) |
@@ -770,7 +832,8 @@ grep '"agent":"writer"' logs/session_<id>.log | jq '.'
 |--------|-----------|------|
 | Inbox check | Weekly (Thursday morning) | Confirm email arrived |
 | `/latest` check | Weekly | Confirm new issue served |
-| GH Actions run review | Weekly | Skim logs for warnings/auto-inserted placeholders |
+| GH Actions run review | Weekly | Skim logs for warnings, auto-inserted placeholders, and `verification_failed` events |
+| Verifier review | Weekly | Check session log for any `verification_failed` events; spot-check the URLs that triggered them |
 | Cost review | Monthly | Anthropic dashboard; investigate if > $10/run |
 | Subscriber audit | Monthly | `/admin` page; remove obvious dupes/typos |
 | Anthropic key rotation | Quarterly | Generate new key, update Vercel + GH secrets |
