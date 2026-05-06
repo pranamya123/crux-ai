@@ -1,6 +1,6 @@
 # I Built a Newsletter That Writes Itself
 
-AI Weekly is an autonomous newsletter generated end-to-end by eight specialized Anthropic Managed Agents coordinating through a shared event-sourced session log. Every Thursday, the system researches the past week's AI work, evaluates candidates against a structured rubric, drafts and critiques the brief, verifies every URL and citation against reality, and delivers the issue via SMTP without any manual intervention. The goal is to filter the high volume of weekly AI announcements down to the developments that materially affect how engineers build, paired with two research papers an engineer or product manager can apply directly in production.
+Crux AI is an autonomous newsletter generated end-to-end by eight specialized Anthropic Managed Agents coordinating through a shared event-sourced session log. Every Thursday, the system researches the past week's AI work, evaluates candidates against a structured rubric, drafts and critiques the brief, verifies every URL and citation against reality, and delivers the issue via SMTP without any manual intervention. The goal is to filter the high volume of weekly AI announcements down to the developments that materially affect how engineers build, paired with two research papers an engineer or product manager can apply directly in production.
 
 ## How I started
 
@@ -74,7 +74,7 @@ The summary numbers worth keeping in mind: in the steady state, cost per run ave
 
 This architecture fits when you have multiple specialized agents with genuinely different responsibilities, long-horizon execution running for several minutes per pipeline, quality gates between agents (a Critic that can reject the Writer's output is the canonical example), cross-run memory needs, and operational quietness as an explicit goal. It is overkill for single-shot tasks, deterministic workflows, low-stakes outputs where misfires are inconsequential, and high-frequency pipelines where session setup overhead dominates the actual work.
 
-AI Weekly is intentionally over-engineered for one subscriber. The point of the project was to exercise every Managed Agents pattern in a realistic production setting (parallel branches, feedback loops, shared session state, durable resume, custom tools, hallucination grounding) rather than to optimize the marginal cost of producing a newsletter for a small audience. As a learning exercise it is the right shape; as a one-subscriber newsletter, it absolutely is not.
+Crux AI is intentionally over-engineered for one subscriber. The point of the project was to exercise every Managed Agents pattern in a realistic production setting (parallel branches, feedback loops, shared session state, durable resume, custom tools, hallucination grounding) rather than to optimize the marginal cost of producing a newsletter for a small audience. As a learning exercise it is the right shape; as a one-subscriber newsletter, it absolutely is not.
 
 The hardest part of the project was developing judgment for which architectural patterns actually matter for which workloads. Managed Agents fits systems that need specialization, coordination, and durable state together. If you only need one or two of those properties, a direct call to the Messages API will accomplish the same outcome at a fraction of the complexity. When you do need all three, and the next generation of AI features being embedded in real products often will, the patterns I exercised here recur: event-sourced session logs, per-tool retry policies, stateless orchestrators with replaceable runners, critic loops with bounded retries, hallucination verification before delivery, and quality rubrics with structured reasoning. None of these patterns are new. They are roughly thirty years of distributed systems wisdom applied to a new substrate. The substrate happens to be agents. The engineering carries over.
 
@@ -84,4 +84,4 @@ Two upgrades I scoped out but deferred. The first is RAG over past issues using 
 
 ---
 
-*Code is at [github.com/pranamya123/ai-weekly](https://github.com/pranamya123/ai-weekly). The current issue is served at [ai-weekly-ecru.vercel.app](https://ai-weekly-ecru.vercel.app).*
+*Code is at [github.com/pranamya123/crux-ai](https://github.com/pranamya123/crux-ai). The current issue is served at [ai-weekly-ecru.vercel.app](https://ai-weekly-ecru.vercel.app).*

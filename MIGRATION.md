@@ -1,4 +1,4 @@
-# AI Weekly Migration: Supabase → Anthropic Memory Stores + Credential Vault
+# Crux AI Migration: Supabase → Anthropic Memory Stores + Credential Vault
 
 **Status:** ✅ Phase 1 Complete | 🔄 Phase 2 In Progress | ✅ Phase 3 Ready to Deploy
 

@@ -1,5 +1,5 @@
 """
-Credential Management for AI Weekly Newsletter.
+Credential Management for Crux AI Newsletter.
 
 Handles retrieval of sensitive credentials from multiple sources with a fallback chain:
 1. Anthropic Managed Credentials (when available in Managed Agents environment)

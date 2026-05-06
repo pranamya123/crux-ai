@@ -1,5 +1,5 @@
 """
-Observability for AI Weekly: Structured logging, metrics, and run tracking.
+Observability for Crux AI: Structured logging, metrics, and run tracking.
 
 Goals:
 - JSON structured logs for machine parsing

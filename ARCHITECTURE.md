@@ -1,4 +1,4 @@
-# AI Weekly — System Architecture
+# Crux AI — System Architecture
 
 **Document type:** Technical architecture
 **Audience:** Engineers, technical reviewers, architecture interviewers
@@ -9,7 +9,7 @@
 
 ## 0. Executive Summary
 
-AI Weekly is an autonomous newsletter system that ships one issue every Thursday, written end-to-end by **eight specialized Anthropic Managed Agents** coordinating through a shared event log. The system aligns with the patterns described in Anthropic's *"Scaling Managed Agents: Decoupling the brain from the hands"* (April 2026) — agents (brains), tools (hands), and session state are independent abstractions that can fail, retry, or be replaced without disturbing each other.
+Crux AI is an autonomous newsletter system that ships one issue every Thursday, written end-to-end by **eight specialized Anthropic Managed Agents** coordinating through a shared event log. The system aligns with the patterns described in Anthropic's *"Scaling Managed Agents: Decoupling the brain from the hands"* (April 2026) — agents (brains), tools (hands), and session state are independent abstractions that can fail, retry, or be replaced without disturbing each other.
 
 **Key design choices:**
 
@@ -515,7 +515,7 @@ The Writer's markdown output is consumed by the email renderer (`email_renderer.
 - **Consumer:** `email_renderer.py`, whose regex assumes that shape.
 
 **The contract specifically requires:**
-- H1 title: `# AI Weekly — <theme>`
+- H1 title: `# Crux AI — <theme>`
 - Section heading containing "what shipped" → routed to `company_items`
 - Section heading containing "research" or "worth knowing" → routed to `research_items`
 - Each item under a section: `### N. Title` (numbered H3, period after the number)

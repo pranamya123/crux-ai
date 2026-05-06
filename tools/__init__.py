@@ -1,5 +1,5 @@
 """
-Tools (Hands) for AI Weekly orchestrator.
+Tools (Hands) for Crux AI orchestrator.
 
 Each tool is an independent "hand" that can fail/be replaced independently.
 Aligns with Anthropic's "Scaling Managed Agents" decoupling pattern:

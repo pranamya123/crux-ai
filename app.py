@@ -71,7 +71,7 @@ def unsubscribe():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Weekly — {title}</title>
+    <title>Crux AI — {title}</title>
     <style>
         body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#fafafa; color:#333; }}
         .container {{ max-width:560px; margin:80px auto; padding:40px 24px; background:#fff; border:1px solid #eee; border-radius:6px; text-align:center; }}
@@ -84,7 +84,7 @@ def unsubscribe():
     <div class="container">
         <h1>{title}</h1>
         <p>{message}</p>
-        <p style="margin-top:30px;font-size:0.9em;color:#666;"><a href="/">Back to AI Weekly</a></p>
+        <p style="margin-top:30px;font-size:0.9em;color:#666;"><a href="/">Back to Crux AI</a></p>
     </div>
 </body>
 </html>'''
@@ -101,7 +101,7 @@ def unsubscribe():
             return page("Already unsubscribed", f"{email} is not on the subscriber list.", ok=True)
 
         supabase.table('subscribers').delete().eq('email', email).execute()
-        return page("Unsubscribed", f"{email} has been removed from the AI Weekly list. You won't receive any more issues.", ok=True)
+        return page("Unsubscribed", f"{email} has been removed from the Crux AI list. You won't receive any more issues.", ok=True)
     except Exception as e:
         print(f"Error unsubscribing {email}: {e}")
         return page("Unsubscribe", "Something went wrong. Please try again later.", ok=False), 500
@@ -114,7 +114,7 @@ def latest_issue():
 
     if not os.path.exists(html_path):
         return Response(
-            '''<!DOCTYPE html><html><head><meta charset="utf-8"><title>AI Weekly — Latest issue</title></head>
+            '''<!DOCTYPE html><html><head><meta charset="utf-8"><title>Crux AI — Latest issue</title></head>
 <body style="font-family:Georgia,serif;max-width:560px;margin:80px auto;text-align:center;color:#333;">
 <h1 style="font-weight:normal;">No issue published yet</h1>
 <p>Check back after the next Thursday send. <a href="/" style="color:#666;">Subscribe</a> to be the first to get it.</p>
@@ -156,7 +156,7 @@ def admin():
         <!DOCTYPE html>
         <html>
         <head>
-            <title>AI Weekly - Subscribers</title>
+            <title>Crux AI - Subscribers</title>
             <style>
                 body {{ font-family: system-ui; max-width: 800px; margin: 40px auto; padding: 20px; }}
                 h1 {{ color: #333; }}
@@ -165,7 +165,7 @@ def admin():
             </style>
         </head>
         <body>
-            <h1>AI Weekly Subscribers</h1>
+            <h1>Crux AI Subscribers</h1>
             <p class="count">Total: {len(subscribers)} subscribers</p>
             <textarea readonly>{emails_text}</textarea>
             <p style="color: #999; font-size: 0.85em;">Copy these emails to your .env RECIPIENT_EMAILS on Wednesday before the Thursday send.</p>

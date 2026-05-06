@@ -1,4 +1,4 @@
-# AI Weekly
+# Crux AI
 
 > Autonomous weekly AI newsletter generated end-to-end by 8 specialized Anthropic Managed Agents coordinating through a shared event-sourced session log. Ships every Thursday with zero manual intervention.
 
@@ -10,7 +10,7 @@
 
 ## Architecture
 
-![AI Weekly Architecture](./architecture_diagram.svg)
+![Crux AI Architecture](./architecture_diagram.svg)
 
 > The diagram above reflects the v1 (7-agent) design. The current system has 8 agents — a Verifier was added between Critic and Delivery to ground every URL and arXiv citation against the live web before delivery. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the current design.
 
@@ -98,8 +98,8 @@ Full setup in [DEPLOYMENT.md](./DEPLOYMENT.md).
 ### Local (development)
 
 ```bash
-git clone https://github.com/pranamya123/ai-weekly.git
-cd ai-weekly
+git clone https://github.com/pranamya123/crux-ai.git
+cd crux-ai
 pip install -r requirements.txt
 cp .env.example .env   # fill in the keys below
 python3 orchestrator_v2.py

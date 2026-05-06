@@ -1,4 +1,4 @@
-# AI Weekly — Distribution muscle from the incumbents, and a sharper lens on agent safety
+# Crux AI — Distribution muscle from the incumbents, and a sharper lens on agent safety
 
 This week was about who controls the default. OpenAI swapped the model under ChatGPT, Anthropic landed inside Microsoft 365, and AWS opened Bedrock to Codex — three moves that change what 'shipping on AI' means for buyers locked into a cloud or a productivity suite. On the research side, two papers argue that the way most teams evaluate single models and single fine-tunes is missing the failure modes that actually matter in production agents.
 

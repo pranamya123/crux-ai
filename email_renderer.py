@@ -38,7 +38,7 @@ def _style_inline_html(html: str) -> str:
 
 
 def _parse_brief(md_text: str) -> dict:
-    out = {"title": "AI Weekly", "date": "", "lead": "", "company_items": [],
+    out = {"title": "Crux AI", "date": "", "lead": "", "company_items": [],
            "research_items": [], "build_idea": ""}
 
     title_match = re.match(r"^#\s+(.+?)\s*$", md_text, re.MULTILINE)
@@ -106,7 +106,7 @@ def _render_item(item, date, anchor_prefix="item", section_label="What shipped",
         f'<article id="{anchor_prefix}-{item["number"]}" style="padding:64px 0 32px;border-top:3px solid {RULE};page-break-before:always;">'
         f'{_label(f"{section_label} · {num_label}")}'
         f'<h2 style="font-family:{SERIF};font-size:32px;line-height:1.18;font-weight:400;letter-spacing:-0.5px;margin:14px 0 12px;color:{INK};">{htmllib.escape(item["headline"])}</h2>'
-        f'<div style="font-family:{SERIF};font-style:italic;font-size:13px;color:{MUTED};margin-bottom:32px;">By the AI Weekly Bot · {htmllib.escape(date) if date else ""}</div>'
+        f'<div style="font-family:{SERIF};font-style:italic;font-size:13px;color:{MUTED};margin-bottom:32px;">By the Crux AI Bot · {htmllib.escape(date) if date else ""}</div>'
         f'<div style="font-family:{SERIF};font-size:18px;line-height:1.7;color:#1f1f1f;">{body}</div>{_back_to_top(link_prefix)}</article>'
     )
 
@@ -189,7 +189,7 @@ def render_brief_email_html(
 
     footer = (
         f'<footer style="border-top:1px solid {RULE};margin-top:64px;padding-top:24px;text-align:center;font-family:{SANS};font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:{MUTED};">'
-        f'AI Weekly · {htmllib.escape(date) if date else ""} · End of issue'
+        f'Crux AI · {htmllib.escape(date) if date else ""} · End of issue'
         f'{unsubscribe_html}'
         f'</footer>'
     )

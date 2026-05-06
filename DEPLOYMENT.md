@@ -1,4 +1,4 @@
-# Deployment Guide: AI Weekly
+# Deployment Guide: Crux AI
 
 **Architecture:** GitHub Actions for orchestration + Vercel for web layer.
 

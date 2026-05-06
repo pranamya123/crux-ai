@@ -6,7 +6,7 @@
 
 ## What I Built
 
-AI Weekly is a newsletter that ships every Thursday at 9am UTC. I haven't touched it in weeks. Seven specialized AI agents do the work — they research the past week's AI ecosystem, score what matters, write the brief, critique it, and send it to subscribers.
+Crux AI is a newsletter that ships every Thursday at 9am UTC. I haven't touched it in weeks. Seven specialized AI agents do the work — they research the past week's AI ecosystem, score what matters, write the brief, critique it, and send it to subscribers.
 
 A typical run costs **~$2** in Anthropic API tokens. It runs unattended on GitHub Actions. New subscribers signed up via the website are auto-included in the next send. The output appears at [`/latest`](https://ai-weekly-ecru.vercel.app/latest), shipped autonomously by the pipeline.
 
@@ -365,7 +365,7 @@ Whether this is worth it depends entirely on your workload. For my 7-agent newsl
 - Low-stakes outputs (no Critic needed if a misfire costs nothing)
 - High-frequency tasks (sub-minute pipelines don't benefit from session overhead)
 
-AI Weekly is intentionally over-engineered for one subscriber. The point was to exercise every Managed Agents pattern in production — parallel branches, feedback loops, shared session state, durable resume, custom tools. As a learning exercise, it's the right shape. As a 1-subscriber newsletter, it absolutely is not.
+Crux AI is intentionally over-engineered for one subscriber. The point was to exercise every Managed Agents pattern in production — parallel branches, feedback loops, shared session state, durable resume, custom tools. As a learning exercise, it's the right shape. As a 1-subscriber newsletter, it absolutely is not.
 
 ---
 
@@ -397,4 +397,4 @@ These aren't novel patterns. They're 30 years of distributed systems wisdom, app
 
 ---
 
-*Code: [github.com/pranamya123/ai-weekly](https://github.com/pranamya123/ai-weekly). Live: [ai-weekly-ecru.vercel.app](https://ai-weekly-ecru.vercel.app). Architecture doc in `ARCHITECTURE.md`.*
+*Code: [github.com/pranamya123/crux-ai](https://github.com/pranamya123/crux-ai). Live: [ai-weekly-ecru.vercel.app](https://ai-weekly-ecru.vercel.app). Architecture doc in `ARCHITECTURE.md`.*
