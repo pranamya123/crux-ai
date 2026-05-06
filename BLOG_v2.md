@@ -1,130 +1,87 @@
 # I Built a Newsletter That Writes Itself
 
-I find it hard to keep up with what's happening in AI. New models drop weekly. Research papers stack up faster than I can read them.
-
-So I built a weekly newsletter that surfaces the meaningful work and pairs it with two research papers I can actually apply in production. It runs every Thursday at 9am UTC. I don't touch it. Each issue costs about $2 in API credits.
-
-This was also an excuse to use Anthropic's Managed Agents on a real workload. The "[Decoupling the brain from the hands](https://www.anthropic.com/engineering/scaling-managed-agents)" article from April had been sitting in my head — stateless harnesses, brains separate from tools, a session log that outlasts both. I wanted to feel that in practice.
+AI Weekly is an autonomous newsletter generated end-to-end by eight specialized Anthropic Managed Agents coordinating through a shared event-sourced session log. Every Thursday, the system researches the past week's AI work, evaluates candidates against a structured rubric, drafts and critiques the brief, verifies every URL and citation against reality, and delivers the issue via SMTP without any manual intervention. The goal is to filter the high volume of weekly AI announcements down to the developments that materially affect how engineers build, paired with two research papers an engineer or product manager can apply directly in production.
 
 ## How I started
 
-I started with one agent in the Claude Console, just to feel the surface area.
+The trigger was Anthropic's April article on [decoupling the brain from the hands](https://www.anthropic.com/engineering/scaling-managed-agents). Its core argument was that harnesses should be stateless, agents (brains) should be decoupled from tools (hands), and the session log should outlast both. This sounded clean as architecture, but I wanted to feel it in production code rather than just nod along to it. A weekly newsletter was a good excuse: it has a real pipeline, real quality stakes, and real cost pressure.
 
-A few decisions in the first hour: SMTP via Gmail because I didn't want vendor lock-in for an MVP. Many agents eventually, but starting with one and splitting roles as the boundaries became obvious. Where state lives — I didn't have an answer yet.
+I started with a single agent in the Claude Console to develop a feel for the platform. Within the first hour, I had decided to use Gmail SMTP because I did not want vendor lock-in for an MVP, to eventually split work across multiple specialized agents but start with one and let the boundaries surface naturally, and to defer the question of where state should live because I did not yet have an opinion on it. By Sunday evening I had a single agent dumping markdown to a file, and by Monday morning I had a Flask app on Vercel handling sign-ups and a working pipeline emailing me a brief.
 
-By Sunday, I had a single agent dumping markdown to a file. By Monday, a Flask app on Vercel for subscribers and a working pipeline that emailed me a brief.
-
-Then I realized I was using Managed Agents like a fancier API client. Durable sessions, hot-swappable agents, the brain/hands/session decoupling — none of it was showing up in my code.
-
-So I rewrote it.
+What became clear by Monday afternoon was that I was using Managed Agents as little more than a fancier wrapper around the Messages API. The features that distinguish the platform (durable sessions, hot-swappable agents, the brain/hands/session decoupling) were nowhere in my code. So I put the prototype aside and started over with the architecture I should have built from the beginning.
 
 ## The architecture
 
-Seven agents, each with one job:
+The system that emerged consists of eight specialized agents, each with a single, clearly-defined responsibility. The Memory agent (Haiku) reads what was covered in the previous twelve issues so the rest of the pipeline avoids repetition. Research Launches (Opus) finds significant developments in the AI ecosystem from the past seven days, while Research Papers (Opus) finds papers an engineer or PM could actually act on. The Evaluator (Opus) scores and ranks the candidates against a structured rubric. The Writer (Opus) drafts the brief in markdown. The Critic (Opus) reviews the draft and either approves it or rejects it back to the Writer with specific issues to fix. The Verifier (Haiku) then checks every URL and arXiv citation in the approved draft against reality before anything ships. Finally, the Delivery agent (Haiku) handles per-recipient rendering and SMTP send.
 
-- **Memory** (Haiku) reads what we covered last week
-- **Research Launches** (Opus) finds AI ecosystem developments
-- **Research Papers** (Opus) finds actionable research
-- **Evaluator** (Opus) scores and ranks with a rubric
-- **Writer** (Opus) drafts the brief in markdown
-- **Critic** (Opus) reviews and can reject
-- **Delivery** (Haiku) renders per-recipient and sends via SMTP
+What makes this work as a coherent system rather than eight independent agents is the shared session log. All eight coordinate through a single append-only event log, stored in Anthropic Memory Stores at `/mnt/memory/session_{id}.jsonl`. Each agent emits its work as an event, and downstream agents read those events through custom tools rather than through any conversational context. Everything that matters lives in the log. Treating the session as a database rather than as a context window turned out to be the most consequential decision in the entire project; resume from crash, replay debugging, and cross-agent coordination all become straightforward consequences of state living outside the agents themselves.
 
-All seven coordinate through one shared event log in Anthropic Memory Stores (`/mnt/memory/session_{id}.jsonl`). Each agent emits its work as an event. Downstream agents read prior events through custom tools. Everything important lives in the log; the orchestrator just routes between agents.
-
-That single choice — treating the session as a database — turned out to be the most consequential decision in the project. Resume from crash, replay debugging, cross-agent coordination all become trivial when state lives outside the agents.
-
-The orchestrator itself is a stateless Python process running on GitHub Actions. Vercel hosts the web layer (subscribe form, `/latest`, `/admin`). Supabase holds the subscriber list. That's the whole system.
-
-The mental model from the Anthropic article maps directly: the **brain** is a Managed Agent. The **hand** is a custom tool in `tools/*.py`. The **session** is the JSONL event log. The **harness** is `orchestrator_v2.py`. Each can fail or be replaced without the others noticing.
+The orchestrator is a stateless Python process that runs weekly on GitHub Actions. Vercel hosts the public web layer (subscribe form, `/latest` page, `/admin`), and Supabase holds the subscriber list. The mental model from the Anthropic article maps onto this directly: each Managed Agent is a brain, each module under `tools/` is a hand, the JSONL event log is the session, and `orchestrator_v2.py` is the harness. Each layer can fail or be replaced without disturbing the others, which is what the article promises and what I wanted to verify.
 
 ## Making it production-ready
 
-A working prototype isn't a production system. The gap is observability, error handling, scalability, and the ability to debug at 9am Thursday when something breaks.
+A working prototype is not a production system. The gap between the two is observability, error handling, scalability, and the ability to debug a failure at 9am Thursday morning when the system has clearly not done what it was supposed to. Closing that gap took more time than the original architecture, and it is what made the system trustworthy enough to leave alone.
 
 ### Observability
 
-Two primitives, both deliberately minimal. A `StructuredLogger` emits one JSON line per event with session_id, agent name, timing, token usage. Logs go to stdout (GitHub Actions captures them) and to per-session log files uploaded as workflow artifacts with 30-day retention.
+I built two small primitives, both deliberately minimal. A `StructuredLogger` emits a single JSON object per log line, including session ID, agent name, timing, and token usage. Logs go to standard output (where GitHub Actions captures them) and to per-session log files uploaded as workflow artifacts with thirty days of retention. Alongside this, a `RunTracker` accumulates per-agent timing, token counts, retry counts, and success or failure status into a single `runs/{session_id}.json` summary after each run. I considered Datadog, Sentry, and OpenTelemetry, but at four runs per month the integration cost of any of them was difficult to justify. Structured JSON to standard output stays portable to whichever observability vendor I might eventually adopt.
 
-A `RunTracker` accumulates per-agent timing, token counts, retry counts, and success/failure into a single `runs/{session_id}.json` summary after each run.
+### Error handling
 
-I considered Datadog, Sentry, OpenTelemetry. At four runs a month, the integration cost outweighs the value. Structured JSON to stdout stays portable for whichever vendor I'd adopt later.
+The error handling sits in three layers. The first is per-tool retry with exponential backoff. Each tool has its own retry policy because SMTP failures and filesystem failures have different error profiles. Memory store retries up to three times with a half-second initial backoff; SMTP retries twice with two seconds. The retry decorator (about fifty lines in `retry.py`) recognizes Anthropic's transient error patterns (rate limits, 5xx errors, "overloaded" responses) and treats authentication failures and 4xx errors as immediate, non-retryable failures.
 
-### Error handling, three layers
+The second layer is per-agent timeout and criticality. Each agent has an explicit criticality class. When the Memory agent fails, the pipeline ships the issue without covered topics, which is acceptable. When the Delivery agent fails, the issue does not go out, so the orchestrator aborts. Optional agents getting wedged on a timeout do not bring down the entire pipeline, while critical failures still stop the line.
 
-**Per-tool retry.** Each tool gets its own retry policy because SMTP failures and filesystem failures have very different error profiles. Memory store retries 3 times with 0.5s initial backoff. SMTP retries twice with 2s. The retry decorator (~50 lines in `retry.py`) recognizes Anthropic's transient errors — rate limits, 5xx, "overloaded" — and lets auth failures and 400s fail immediately.
+The third layer is pipeline-level fallbacks, and this is the most important defense in the system even though almost nobody writing about multi-agent architectures discusses it. In two of my first three production runs, the Research Papers agent silently exited without emitting its terminal event. There was no error message, no timeout, no exception in the logs. The agent simply stopped without producing the event downstream agents were waiting for, and the Evaluator sat blocked on it indefinitely. The fix required two layers working together. First, I added an explicit instruction to the agent's system prompt to always call `emit_event` before finishing, even when the result is an empty array. Second, after each step, the orchestrator now checks whether the expected terminal event exists, and if it does not, it inserts a placeholder event itself: a marker that records the failure visibly while letting the rest of the pipeline continue. The Evaluator runs on the placeholder, the pipeline ships an issue with launches but no papers, and the failure stays loud in the logs for me to investigate. After this fix, the silent failure rate dropped from one in three runs to zero.
 
-**Per-agent timeout and criticality.** Each agent has a criticality class. Memory failing means we ship without covered topics, which is fine. Delivery failing means the issue doesn't go out, so the orchestrator aborts. Optional agents getting wedged on a timeout shouldn't kill the pipeline.
+The deeper lesson, which generalizes beyond this specific bug, is that agents amplify failures in a way that ordinary scripts do not. A bad environment variable in a normal script is one HTTP 400 and a clean exit. In an agent loop, the agent reacts to the 400, those reactions cost additional model calls and retries, and the session can poison itself with corrupted context before the underlying problem is addressed. The right response is to validate at the orchestrator boundary with a synchronous error before the agent ever sees the problem.
 
-**Pipeline-level fallbacks.** This is the most important defense, and almost no one talks about it.
+### Hallucination grounding
 
-In two of my first three production runs, the Research Papers agent silently exited without emitting its terminal event. No error. No timeout. The agent just stopped. The Evaluator sat waiting forever.
+The risk that bothered me most as I prepared to ship was hallucination. A research newsletter that fabricates a paper title, a URL, or an author name only needs to do so once before its credibility is gone. The Critic catches a lot of bad writing, but its job is not to verify factual claims, and there was no point in the pipeline at which links and citations were actually checked against reality.
 
-The fix needed two layers. First, I added "ALWAYS call emit_event before finishing, even if the array is empty" to the agent's prompt. Second, after each step the orchestrator checks for the terminal event and inserts a placeholder if it's missing:
+I addressed this by adding a Verifier agent that runs after the Critic approves a draft but before delivery. The Verifier extracts every URL from the approved markdown and runs an HTTP HEAD request against each one (with a GET fallback for servers that reject HEAD). For arXiv links, it queries the arXiv API directly to confirm the paper exists by ID. If everything resolves, it emits a `verification_passed` event and Delivery runs. If anything fails, it emits a `verification_failed` event with the specific bad URLs, which the Writer reads on retry and either replaces with valid sources or removes from the brief. The Verifier runs on Haiku rather than Opus because the work is mechanical rather than judgmental, which keeps its cost negligible at roughly two cents per run.
 
-```python
-{
-  "event_type": "papers_researched",
-  "data": { "papers": [], "auto_inserted": True }
-}
-```
+### Scalability and debugging
 
-The Evaluator runs on the placeholder. The pipeline ships an issue with launches only. The failure stays loud in the logs. Silent failure rate went from 33% to zero.
+The big architectural decision here was an early commitment to running every agent in a fresh Managed Agents session, keeping the orchestrator process stateless, and treating the GitHub Actions runner as ephemeral. Nothing in the system is a pet; every component can be replaced or restarted without consequence.
 
-The deeper lesson: agents amplify failures. A bad env var in a normal script is one HTTP 400 and a clean exit. In an agent loop, the agent reacts to the 400, those reactions cost retries, and the session can poison itself. Validate at the orchestrator boundary with a synchronous error before the agent ever sees it.
+The big architectural mistake was trying to deploy the orchestrator on Vercel Cron. Vercel's Hobby tier caps function execution at sixty seconds, while my pipeline runs between eight and fifteen minutes. The Pro tier extends this to five minutes, which still does not fit. I went through three abandoned designs (a single monolithic Vercel function, a step-based architecture chained through asynchronous HTTP calls, and a Pro upgrade) before landing on GitHub Actions, which provides a six-hour timeout for free with a single YAML configuration file. The general lesson is to match the orchestration platform to the workload duration before assuming the platform you already use will fit.
 
-### Scalability
+Three habits make debugging tractable when something goes wrong. The first is being able to resume from any step using a `--session-id` flag, which means a Critic failure does not require replaying Memory plus Research plus Evaluator. The second is that the Writer/Critic loop is state-driven: the orchestrator decides what to run next based on event counts in the session log, so resuming the pipeline always lands on the correct state automatically, even mid-loop. The third is logging every silently-handled exception, because every `except: pass` is a future debugging session in which I would otherwise wonder why the program exited without explanation.
 
-I made one good decision early and one bad decision late.
+### Contracts between systems
 
-Early: every agent runs a fresh Managed Agents session. The orchestrator process is stateless. The runner is ephemeral. Everything is replaceable.
-
-Late: I tried to deploy the orchestrator on Vercel Cron. Vercel Hobby caps functions at 60 seconds. My pipeline runs 8–15 minutes. Pro caps at 5 minutes. I went through three abandoned designs — single big function, step-based with async HTTP chaining, Pro upgrade — before landing on GitHub Actions. Six-hour timeout, free, single YAML file. The lesson is to match the orchestration platform to the workload duration.
-
-### Debugging
-
-Three habits made this tractable. First, resume from any step via `--session-id`. If something breaks at the Critic, I rerun from there instead of replaying everything before it. Saves about $2 per crash.
-
-Second, the Writer/Critic loop is state-driven. It counts events in the session log to decide what runs next: if drafts equal rejections, the Writer needs to write. If drafts exceed rejections, the Critic needs to review. Resume picks up at the correct state automatically, even mid-loop.
-
-Third, log every silently-handled exception. Every `except: pass` is a future debugging session where I'd wonder why the program ended. A single line to stderr is cheap insurance.
+Late in the project, after adding citation enforcement and the Verifier, I changed the Writer's prompt to use bold-link headings instead of numbered H3s. The pipeline kept passing every internal check: Writer produced output, Critic approved the draft, Verifier confirmed every link resolved, Delivery sent the email. The email arrived completely empty under the section headers. The bug was in the email renderer: a regex looking for `^### N. Title` that no longer matched anything the Writer was now producing. Two systems, two formats, and no test linking them. The lesson is that when prompts and renderers form a structural contract, that contract needs an explicit test. I now run a smoke test that pushes a sample brief through the renderer before any prompt change ships, and the same logic applies anywhere a downstream system parses an LLM's output: prompt changes silently break consumers unless you actively verify the contract holds.
 
 ## What I learned
 
-I instrumented enough to know what actually moved the needle. Five things stand out.
+After instrumenting the system enough to know what was actually moving the needle, five things stood out.
 
-**Prompt caching is the biggest free lever.** It cut my cost from an estimated $8.70 per run to an actual $2.08 — about 76% — with zero engineering. Cache hit rate sits at 83% on Opus inputs. All I had to do was structure prompts so the static parts come first. Most teams worry about token costs while leaving cacheability on the table.
+**Prompt caching is the single largest cost lever available, and it is essentially free in engineering terms.** Anthropic's prompt caching is automatic; the only thing required to benefit from it is structuring prompts so that the static portions come first. This brought my cost from an estimated $8.70 per run to an actual $2.08, a seventy-six percent reduction, with a cache hit rate around eighty-three percent on Opus inputs. Most teams worry about token costs without ever structuring their prompts for cacheability, which leaves a substantial reduction on the table for no real reason.
 
-**Tier your models.** Three of seven agents run on Haiku, four on Opus. That cut another 40% off the cost with no observable quality loss. Save Opus for the agents doing actual judgment — research, writing, critique. Use Haiku for the mechanical work — memory pulls, SMTP sends, simple transformations.
+**Aggressive model tiering matters more than people seem to assume.** Three of my eight agents run on Haiku rather than Opus, which cut costs by another forty percent without observable quality loss on the Haiku-assigned tasks. Reserve Opus for agents that genuinely require judgment, such as research evaluation, writing, and critique. Use Haiku for the mechanical work like memory retrieval, SMTP delivery, and link verification. Reaching for the most capable model on every agent is both expensive and unnecessary in most architectures.
 
-**Parallelize where work is independent.** Research Launches and Research Papers run in a `ThreadPoolExecutor`. That cut the research step's wall-clock in half. Trivial code change.
+**Parallelize independent work.** The Research Launches and Research Papers agents run concurrently in a `ThreadPoolExecutor`, which cuts the wall-clock duration of the research step roughly in half. The code change is trivial; the time savings compound across every run.
 
-**Critic loops are worth their cost when audience matters.** Adding the Critic adds about $0.58 per run, roughly 30%, and catches an estimated half of the bad drafts. If you're shipping to humans, it's worth it. If output quality doesn't matter, skip it.
+**Critic loops are worth their cost when the audience is human.** The Critic adds roughly thirty percent to the per-run cost on average and catches an estimated half of the bad drafts before they reach delivery. If output quality matters to your readers, the trade is clearly worth making. If output quality does not matter, the Critic is dead weight.
 
-**Resume support pays for itself fast.** Event sourcing makes it nearly free once you've committed to it. Worth the design effort for any pipeline over a minute.
+**Resume-from-crash pays for itself faster than people expect.** Once you have committed to event sourcing, supporting resume costs almost nothing additional in design effort, and it is genuinely valuable for any pipeline that runs longer than a minute.
 
-A few numbers worth keeping:
-
-- Cost per run: $2.08 average, $0.77 lowest, $3.91 highest
-- Wall-clock: 8 minutes typical, 12 minutes with a Critic retry
-- Cache hit rate: 83% on Opus inputs
-- Silent failure rate: 33% before the placeholder fix, 0% after
-- Time to MVP on Managed Agents: ~3 days. Estimated time on a custom harness: 2–3 weeks
+The summary numbers worth keeping in mind: in the steady state, cost per run averages $2.08, with a low of $0.77 in cache-friendly runs and a high of $3.91 when the Critic forces multiple retries. The first run after a major prompt change typically lands closer to $5 because the cache has not yet warmed for the new prefixes; after two or three runs on stable prompts, cost settles back into the $2 range. Wall-clock duration is typically eight to eleven minutes, longer when a Critic retry happens. Cache hit rate stays around eighty-three percent on Opus inputs once warmed. The silent failure rate is zero after the placeholder fix, down from thirty-three percent before. Time to a working MVP on Managed Agents was roughly three days, against my estimate of two to three weeks for an equivalent custom harness.
 
 ## When this pattern fits
 
-This pattern fits when you have multiple specialized agents with genuinely different jobs, long-horizon execution, quality gates between agents, cross-run memory needs, and operational quietness as a goal.
+This architecture fits when you have multiple specialized agents with genuinely different responsibilities, long-horizon execution running for several minutes per pipeline, quality gates between agents (a Critic that can reject the Writer's output is the canonical example), cross-run memory needs, and operational quietness as an explicit goal. It is overkill for single-shot tasks, deterministic workflows, low-stakes outputs where misfires are inconsequential, and high-frequency pipelines where session setup overhead dominates the actual work.
 
-It's overkill for single-shot tasks, deterministic workflows, low-stakes outputs, and high-frequency pipelines where session overhead dominates.
+AI Weekly is intentionally over-engineered for one subscriber. The point of the project was to exercise every Managed Agents pattern in a realistic production setting (parallel branches, feedback loops, shared session state, durable resume, custom tools, hallucination grounding) rather than to optimize the marginal cost of producing a newsletter for a small audience. As a learning exercise it is the right shape; as a one-subscriber newsletter, it absolutely is not.
 
-AI Weekly is intentionally over-engineered for one subscriber. The point was to exercise every Managed Agents pattern in production — parallel branches, feedback loops, shared session state, durable resume, custom tools. As a learning exercise, it's the right shape. As a one-subscriber newsletter, it absolutely is not.
+The hardest part of the project was developing judgment for which architectural patterns actually matter for which workloads. Managed Agents fits systems that need specialization, coordination, and durable state together. If you only need one or two of those properties, a direct call to the Messages API will accomplish the same outcome at a fraction of the complexity. When you do need all three, and the next generation of AI features being embedded in real products often will, the patterns I exercised here recur: event-sourced session logs, per-tool retry policies, stateless orchestrators with replaceable runners, critic loops with bounded retries, hallucination verification before delivery, and quality rubrics with structured reasoning. None of these patterns are new. They are roughly thirty years of distributed systems wisdom applied to a new substrate. The substrate happens to be agents. The engineering carries over.
 
-The hardest part of this project was figuring out which architectural patterns matter for which workloads. Managed Agents fits systems that need specialization, coordination, and durable state together. If you only need one or two of those, a direct call to the Messages API will do the job at a fraction of the complexity.
+## What I have not built yet
 
-When you do need all three, the patterns here will recur. Event-sourced session logs. Per-tool retry. Stateless orchestrators with replaceable runners. Critic loops with bounded retries. Auto-fetched live state. Quality rubrics with structured reasoning.
-
-None of these patterns are new. It's 30 years of distributed systems wisdom on a new substrate. The substrate happens to be agents. The engineering carries over.
+Two upgrades I scoped out but deferred. The first is RAG over past issues using Supabase pgvector, which would let the Memory agent do semantic similarity search rather than the string-based deduplication it currently does. This would help in catching cases where "Anthropic's flagship release" and "Claude 4 launches" describe the same event. The second is GitHub MCP integration for the Research Launches agent, which would give it structured access to live repository data (star counts, commit activity, recent releases) instead of relying on web search results filtered through other people's blog posts. Both are clear next steps; neither was load-bearing for the first version of the system.
 
 ---
 
-*Code: [github.com/pranamya123/ai-weekly](https://github.com/pranamya123/ai-weekly). Live: [ai-weekly-ecru.vercel.app](https://ai-weekly-ecru.vercel.app).*
+*Code is at [github.com/pranamya123/ai-weekly](https://github.com/pranamya123/ai-weekly). The current issue is served at [ai-weekly-ecru.vercel.app](https://ai-weekly-ecru.vercel.app).*

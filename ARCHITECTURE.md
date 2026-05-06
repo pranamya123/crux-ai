@@ -507,7 +507,27 @@ This unblocks the Evaluator (which depends on the terminal event existing), pres
 **Why we don't have a global "alert on failure" yet:**
 GitHub Actions emails the workflow owner on job failure. That's the alert. We have not added Slack/PagerDuty because the system runs once a week and the GitHub email is sufficient.
 
-### 4.9 Hallucination grounding (Verifier loop)
+### 4.9 Implicit contracts between systems
+
+The Writer's markdown output is consumed by the email renderer (`email_renderer.py`), which parses it with regex to identify section headings and per-item entries. This forms an **implicit structural contract** between two systems:
+
+- **Producer:** Writer agent system prompt, which dictates the markdown shape.
+- **Consumer:** `email_renderer.py`, whose regex assumes that shape.
+
+**The contract specifically requires:**
+- H1 title: `# AI Weekly — <theme>`
+- Section heading containing "what shipped" → routed to `company_items`
+- Section heading containing "research" or "worth knowing" → routed to `research_items`
+- Each item under a section: `### N. Title` (numbered H3, period after the number)
+- Item body paragraph(s) directly below the H3
+
+**Why it matters:** When the Writer's prompt was updated late in the project to use bold-link headings instead of numbered H3s, the pipeline kept passing every internal check (Writer produced output, Critic approved, Verifier confirmed every link resolved, Delivery sent) but the email arrived empty under the section headers because the renderer's regex no longer matched.
+
+**The defense:** A smoke test at `scripts/test_render.py` (or equivalent) feeds a sample brief through the renderer and asserts the rendered HTML contains the expected items before any prompt change ships. The Critic's `STRUCTURE CHECKS` section also enforces the format from the producer side, so a structurally invalid draft is rejected before it reaches Verify or Delivery.
+
+**The general principle:** Anywhere a downstream system parses an LLM's output, the prompt and the parser form a contract that must be tested explicitly. Prompt iteration breaks consumers silently otherwise.
+
+### 4.10 Hallucination grounding (Verifier loop)
 
 The risk that a Critic-approved draft could still contain a fabricated URL or a non-existent arXiv paper is real and high-impact: a single hallucinated citation in a research newsletter destroys reader trust permanently. The Critic catches a lot of bad writing but cannot verify factual claims against external reality. The Verifier closes that gap.
 
@@ -686,6 +706,10 @@ This is a small, public-facing system. We did not over-engineer security, but we
 - Gmail SMTP: $0
 - **Total: $8–$32/month**
 
+**Total project cost (all-in, including prototyping and development):**
+- Across the entire project lifecycle (initial prototyping, prompt iterations, debugging, multiple production runs): **$49.04** in Anthropic API credits.
+- This figure includes all the runs that exposed the silent-failure bug, the renderer-contract bug, and the prompt iterations needed to stabilize all eight agents.
+
 ---
 
 ## 9. Decisions Log
@@ -704,6 +728,8 @@ Brief notes on choices that warrant justification.
 | Citation enforcement at prompt + Critic check | Just hope the Writer cites things | Two-layer defense: Writer must include links by prompt; Critic rejects drafts that don't. Pairs with Verifier for full trust hardening. |
 | Verifier on Haiku, not Opus | All-Opus | Verification is mechanical (read draft, call HTTP); no judgment needed. Cuts cost to ~$0.02/run |
 | Bounded verification retries (`MAX_VERIFICATION_RETRIES = 2`) | Unlimited retries | If URLs keep failing, the source data is broken; better to skip a week than ship a verified-fabricated issue |
+| Writer output format constrained to `### N. Title` H3s | Free-form markdown | Email renderer parses with regex; structural contract is enforced at the prompt and again by the Critic to prevent silent rendering failures |
+| Smoke test the renderer on prompt changes | Manually run the pipeline after each prompt edit | Costs ~$2 per pipeline run; smoke test costs zero and catches the same class of bug |
 | Opus for cognitive agents, Haiku for mechanical | All-Opus; All-Haiku | Tiering cuts ~40% of cost with no observable quality loss on Haiku-assigned tasks |
 | Supabase as live subscriber source | Static `RECIPIENT_EMAILS` env | Avoids weekly manual env-var updates after subscribe/unsubscribe |
 | Commit `latest_issue.html` to repo | Object storage (S3); database blob | Free; auditable; rolls back via git revert |
@@ -834,6 +860,7 @@ grep '"agent":"writer"' logs/session_<id>.log | jq '.'
 | `/latest` check | Weekly | Confirm new issue served |
 | GH Actions run review | Weekly | Skim logs for warnings, auto-inserted placeholders, and `verification_failed` events |
 | Verifier review | Weekly | Check session log for any `verification_failed` events; spot-check the URLs that triggered them |
+| Renderer smoke test | Before any Writer prompt change | Push a sample brief through `email_renderer.py`; assert the output HTML contains the expected number of items. Costs zero, catches the contract-drift class of bugs |
 | Cost review | Monthly | Anthropic dashboard; investigate if > $10/run |
 | Subscriber audit | Monthly | `/admin` page; remove obvious dupes/typos |
 | Anthropic key rotation | Quarterly | Generate new key, update Vercel + GH secrets |
