@@ -84,4 +84,4 @@ Two upgrades I scoped out but deferred. The first is RAG over past issues using 
 
 ---
 
-*Code is at [github.com/pranamya123/crux-ai](https://github.com/pranamya123/crux-ai). The current issue is served at [ai-weekly-ecru.vercel.app](https://ai-weekly-ecru.vercel.app).*
+*Code is at [github.com/pranamya123/crux-ai](https://github.com/pranamya123/crux-ai). The current issue is served at [crux-ai-weekly.vercel.app](https://crux-ai-weekly.vercel.app).*

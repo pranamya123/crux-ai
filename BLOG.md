@@ -8,7 +8,7 @@
 
 Crux AI is a newsletter that ships every Thursday at 9am UTC. I haven't touched it in weeks. Seven specialized AI agents do the work — they research the past week's AI ecosystem, score what matters, write the brief, critique it, and send it to subscribers.
 
-A typical run costs **~$2** in Anthropic API tokens. It runs unattended on GitHub Actions. New subscribers signed up via the website are auto-included in the next send. The output appears at [`/latest`](https://ai-weekly-ecru.vercel.app/latest), shipped autonomously by the pipeline.
+A typical run costs **~$2** in Anthropic API tokens. It runs unattended on GitHub Actions. New subscribers signed up via the website are auto-included in the next send. The output appears at [`/latest`](https://crux-ai-weekly.vercel.app/latest), shipped autonomously by the pipeline.
 
 This post is about the path from "let me try Managed Agents" to a production system that wakes up weekly. Specifically, the **eleven things that broke** and what I learned fixing them.
 
@@ -397,4 +397,4 @@ These aren't novel patterns. They're 30 years of distributed systems wisdom, app
 
 ---
 
-*Code: [github.com/pranamya123/crux-ai](https://github.com/pranamya123/crux-ai). Live: [ai-weekly-ecru.vercel.app](https://ai-weekly-ecru.vercel.app). Architecture doc in `ARCHITECTURE.md`.*
+*Code: [github.com/pranamya123/crux-ai](https://github.com/pranamya123/crux-ai). Live: [crux-ai-weekly.vercel.app](https://crux-ai-weekly.vercel.app). Architecture doc in `ARCHITECTURE.md`.*

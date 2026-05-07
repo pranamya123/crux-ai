@@ -2,8 +2,8 @@
 
 > Autonomous weekly AI newsletter generated end-to-end by 8 specialized Anthropic Managed Agents coordinating through a shared event-sourced session log. Ships every Thursday with zero manual intervention.
 
-🌐 **Live:** [ai-weekly-ecru.vercel.app](https://ai-weekly-ecru.vercel.app) — subscribe form on the homepage
-📰 **Latest issue:** [ai-weekly-ecru.vercel.app/latest](https://ai-weekly-ecru.vercel.app/latest)
+🌐 **Live:** [crux-ai-weekly.vercel.app](https://crux-ai-weekly.vercel.app) — subscribe form on the homepage
+📰 **Latest issue:** [crux-ai-weekly.vercel.app/latest](https://crux-ai-weekly.vercel.app/latest)
 📐 **Design docs:** [ARCHITECTURE.md](./ARCHITECTURE.md) · [DEPLOYMENT.md](./DEPLOYMENT.md)
 
 ---
