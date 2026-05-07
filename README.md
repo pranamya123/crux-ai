@@ -202,7 +202,7 @@ architecture_diagram.svg        # One-page system diagram
 
 ## Contact
 
-Built by [Pranamya Vadlamani](https://www.linkedin.com/in/pvadlamani1/). Currently looking for Applied AI Engineer / Forward Deployed Engineer roles. If you are hiring for that kind of work or want to chat about the project, reach out on LinkedIn.
+Built by [Pranamya Vadlamani](https://www.linkedin.com/in/pvadlamani1/). 
 
 ---
 
