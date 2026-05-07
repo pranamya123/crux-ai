@@ -10,9 +10,13 @@
 
 ## Architecture
 
-![Crux AI Architecture](./architecture_diagram.svg)
+> 📐 Diagram in progress. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full system design, component breakdown, and end-to-end data flow.
 
-> The diagram above reflects the v1 (7-agent) design. The current system has 8 agents — a Verifier was added between Critic and Delivery to ground every URL and arXiv citation against the live web before delivery. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the current design.
+<!-- TODO: when the new 8-agent diagram is ready, save it as architecture_diagram.svg
+     in the repo root and replace this section with:
+     ![Crux AI Architecture](./architecture_diagram.svg)
+-->
+
 
 ---
 
@@ -165,7 +169,7 @@ api/
   newsletter.yml                # GitHub Actions cron + manual trigger
 ARCHITECTURE.md                 # Full design write-up
 DEPLOYMENT.md                   # Setup instructions
-architecture_diagram.svg        # One-page system diagram (v1, 7-agent)
+architecture_diagram.svg        # One-page system diagram
 ```
 
 ---
