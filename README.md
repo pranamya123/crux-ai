@@ -186,7 +186,8 @@ A public run-history endpoint reading from `runs/*.json` for cost and timing tre
 
 - **Architecture deep-dive:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **Deployment guide:** [DEPLOYMENT.md](./DEPLOYMENT.md)
-- **Technical writeup:** *coming soon. Medium article link will be added once published.*
+- **Technical writeup (Medium):** [I built an autonomous newsletter to stress-test Anthropic Managed Agents](https://medium.com/@vadlamanipranamya/i-built-an-autonomous-newsletter-to-stress-test-anthropic-managed-agents-332bf683d9e9)
+- **Technical writeup (Substack):** [Crux AI: A Production Experiment with Anthropic Managed Agents](https://substack.com/home/post/p-196714067)
 
 ---
 
